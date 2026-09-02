@@ -1,0 +1,75 @@
+//AuditLogs UserPrincipal query
+//
+// Directory-change investigation. Built on the same design as
+// signinlogs.kql: fill in a CHECK value at the top and run, leave it blank
+// and it returns everything, and every `let` below joins one more piece of
+// context onto every row.
+//
+// SigninLogs tells you somebody got in. AuditLogs tells you what they did
+// once they were there, and what they left behind so they can come back.
+//
+// TWO IDENTITIES PER ROW, NOT ONE
+// Every directory change has an ACTOR (who did it) and a TARGET (who or what
+// was changed). UserIdentityCheck matches either, which is what you want when
+// you have one name and no idea which side of the change they are on.
+// ActorCheck and TargetCheck narrow it once you do know.
+//
+// READING THE DYNAMIC COLUMNS
+// InitiatedBy and TargetResources are where everything useful lives.
+// TargetResources is an ARRAY, so it is expanded — one row per target — and
+// modifiedProperties inside it is expanded again to get the before and after
+// values out. Do not string-match the raw JSON to reach a field: it finds the
+// right event and the wrong field, and breaks silently when a property moves.
+//
+// ONE COLUMN DELIBERATELY NOT DROPPED
+// TenantId is left in the output. Microsoft's published AuditLogs schema does
+// not list it, and project-away on a column that does not exist fails the
+// whole query rather than skipping the name. An extra column on the far right
+// is cheaper than a query that will not run. Add it to project-away if your
+// workspace has it.
+//
+// THE COLUMN THAT DECIDES IT
+// DaysActorSeenFromIP — how many days the actor has SIGNED IN successfully
+// from the address the change was made from. An administrator does their job
+// from the address they always use. A 0 or a 1 on a privilege-granting
+// operation is the finding.
+//
+let TimeToCheck = 30d;
+let UserIdentityCheck = "";
+let ActorCheck = "";
+let TargetCheck = "";
+let OperationCheck = "";
+let IPtoCheck = "";
+//
+let Job = IdentityInfo | where AccountUPN contains UserIdentityCheck | where TimeGenerated >=ago(90d) | extend AccountUPN = tolower(AccountUPN)| summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles, "3.Manager", Manager) | project JobDetails, JobUserKey = AccountUPN;
+let NewStarterCheck = AuditLogs | where TimeGenerated >ago(90d) | where OperationName == "Add user" | mv-expand TargetResources | extend NsUserKey = tolower(tostring(TargetResources.userPrincipalName)) | where isnotempty(NsUserKey) | summarize StartDate = min(ActivityDateTime) by NsUserKey;
+let AllOpCounts = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | extend AoActor = tolower(coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))) | summarize DaysOpSeenInOrg = dcount(bin(TimeGenerated, 1d)), ActorsUsingOp = dcount(AoActor) by AoOpName = OperationName;
+let ActorOpCounts = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | extend AcActor = tolower(coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))) | where AcActor contains tolower(UserIdentityCheck) | summarize DaysOpSeenByActor = dcount(bin(TimeGenerated, 1d)) by AcActor, AcOpName = OperationName;
+let ActorActivity = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | extend AaActor = tolower(coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))) | where isnotempty(AaActor) | summarize ActorChangesInWindow = count(), ActorOpTypes = dcount(OperationName), ActorDaysActive = dcount(bin(TimeGenerated, 1d)) by AaActor;
+let ActorSignInFromIP = SigninLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | summarize DaysActorSeenFromIP = dcount(bin(TimeGenerated, 1d)) by SiActor = tolower(UserPrincipalName), SiIP = IPAddress;
+let ActorsFromThisIP = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | extend AiActor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), AiIP = tostring(InitiatedBy.user.ipAddress) | where isnotempty(AiIP) | summarize ActorsFromThisIP = make_set(AiActor, 50) by AiIP;
+let TargetChangeCount = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | mv-expand TargetResources | extend TcTarget = tolower(coalesce(tostring(TargetResources.userPrincipalName), tostring(TargetResources.displayName))) | where isnotempty(TcTarget) | summarize ChangesToTarget = count(), ActorsChangingTarget = dcount(tostring(InitiatedBy.user.userPrincipalName)) by TcTarget;
+//
+AuditLogs
+| where TimeGenerated >= ago(TimeToCheck)
+| extend Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)) | extend ActorIP = tostring(InitiatedBy.user.ipAddress) | extend ActorIsApp = isempty(tostring(InitiatedBy.user.userPrincipalName)) | extend ActorAppId = tostring(InitiatedBy.app.appId)
+| mv-expand TargetResources
+| extend Target = coalesce(tostring(TargetResources.userPrincipalName), tostring(TargetResources.displayName)) | extend TargetType = tostring(TargetResources.type) | extend TargetId = tostring(TargetResources.id)
+// mv-apply over an EMPTY array drops the row, and plenty of operations carry
+// no modifiedProperties at all. Substitute a one-element array so those events
+// survive with blank values rather than vanishing from the result.
+| extend PropList = iff(array_length(todynamic(TargetResources.modifiedProperties)) > 0, todynamic(TargetResources.modifiedProperties), dynamic([{}]))
+| mv-apply Prop = PropList on ( summarize ChangedProperties = make_set(tostring(Prop.displayName), 10), OldValues = make_set(trim(@'"', tostring(Prop.oldValue)), 10), NewValues = make_set(trim(@'"', tostring(Prop.newValue)), 10) )
+| extend ActorKey = tolower(Actor), TargetKey = tolower(Target)
+| join kind=leftouter Job on $left.ActorKey == $right.JobUserKey | join kind=leftouter NewStarterCheck on $left.TargetKey == $right.NsUserKey | join kind=leftouter AllOpCounts on $left.OperationName == $right.AoOpName | join kind=leftouter ActorOpCounts on $left.ActorKey == $right.AcActor, $left.OperationName == $right.AcOpName
+| join kind=leftouter ActorActivity on $left.ActorKey == $right.AaActor | join kind=leftouter ActorSignInFromIP on $left.ActorKey == $right.SiActor, $left.ActorIP == $right.SiIP | join kind=leftouter ActorsFromThisIP on $left.ActorIP == $right.AiIP | join kind=leftouter TargetChangeCount on $left.TargetKey == $right.TcTarget
+| where Actor contains UserIdentityCheck or Target contains UserIdentityCheck | where Actor contains ActorCheck | where Target contains TargetCheck | where OperationName contains OperationCheck | where ActorIP contains IPtoCheck
+| extend DaysActorSeenFromIP = coalesce(DaysActorSeenFromIP, 0) | extend ActorsFromIPCount = array_length(ActorsFromThisIP)
+| extend ChangedProperties = strcat_array(ChangedProperties, ", "), OldValue = strcat_array(OldValues, ", "), NewValue = strcat_array(NewValues, ", ")
+| project-rename LogCreatedTime = TimeGenerated, EventTime = ActivityDateTime
+//| summarize arg_max(EventTime, *) by CorrelationId
+| project-reorder EventTime, LogCreatedTime, OperationName, AADOperationType, Result, ResultReason, Actor, ActorIP, DaysActorSeenFromIP, ActorsFromIPCount, ActorsFromThisIP, JobDetails, ActorIsApp, ActorAppId, ActorChangesInWindow, ActorOpTypes, ActorDaysActive, DaysOpSeenByActor, DaysOpSeenInOrg, ActorsUsingOp, Target, TargetType, StartDate, ChangesToTarget, ActorsChangingTarget, ChangedProperties, OldValue, NewValue, Category, LoggedByService, CorrelationId, Id
+| project-away SourceSystem, Type, Level, DurationMs, ResultSignature, OperationVersion, Resource*, AADTenantId, Location, Identity, ResultType, ResultDescription, TargetResources, InitiatedBy, PropList, OldValues, NewValues, ActorKey, TargetKey, JobUserKey, NsUserKey, AoOpName, AcActor, AcOpName, AaActor, SiActor, SiIP, AiIP, TcTarget, TargetId
+| sort by EventTime desc
+//| where ActorIsApp == true
+//| where DaysActorSeenFromIP <= 1

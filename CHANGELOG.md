@@ -6,7 +6,14 @@ Notable changes to this repository. Format follows
 ## [Unreleased]
 
 ### Added
-- `queries/signinlogs.kql` — SigninLogs UserPrincipal query, v20251217. Sign-in
+- `queries/auditlogs.kql` — AuditLogs UserPrincipal query. Directory
+  changes with the actor and the target on every row, `modifiedProperties`
+  unpacked into old and new values, operation rarity per actor and tenant-wide,
+  and the actor's sign-in history from the address the change was made from.
+- `queries/officeactivity.kql` — OfficeActivity UserPrincipal query. Exchange, SharePoint, OneDrive and Teams activity with `ClientIP` cleaned of
+  its port, operation and workload rarity per user, and the account's sign-in
+  history from the source address.
+- `queries/signinlogs.kql` — SigninLogs UserPrincipal query. Sign-in
   investigation for a user, IP or device, joined to IdentityInfo for job
   details, AuditLogs for a new-starter check, and day-counts for the address,
   device, location, user agent and application.

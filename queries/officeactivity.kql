@@ -1,0 +1,67 @@
+//OfficeActivity UserPrincipal query
+//
+// Microsoft 365 activity investigation — Exchange, SharePoint, OneDrive and
+// Teams. Same design as signinlogs.kql: fill in a CHECK value at the top and
+// run, leave it blank and it returns everything, and every `let` below joins
+// one more piece of context onto every row.
+//
+// SigninLogs says they got in. AuditLogs says what they changed in the
+// directory. This says what they did to the data.
+//
+// THE COLUMN THAT DECIDES IT
+// DaysUserSignedInFromIP — how many days this account SIGNED IN successfully
+// from the address the activity came from. Zero means the session was
+// established some other way: a stolen token, a mailbox delegation, or an
+// application acting on the user's behalf. That is normal for some service
+// traffic and is the entire finding for a compromised mailbox, so read it
+// next to Operation before deciding which.
+//
+// WHY ClientIP IS CLEANED
+// The unified audit log writes the port on the address — "1.2.3.4:52133" —
+// and brackets IPv6 — "[2001:db8::1]:443". Joining on the raw value matches
+// nothing at all. CleanIP strips both. The "::" test keeps compressed IPv6
+// intact; a fully-written IPv6 address with no brackets and no "::" would be
+// truncated, which the audit log does not produce when it appends a port.
+//
+// THE TABLE IS SPARSE
+// Which columns are populated depends entirely on OfficeWorkload. A query
+// that reads beautifully for Exchange returns blank columns for SharePoint.
+// Set WorkloadCheck first when you know which one you are looking at.
+//
+// IF YOU ARE ON DEFENDER XDR INSTEAD
+// The equivalent table is CloudAppEvents. Parameters becomes RawEventData,
+// and the acting account is RawEventData.UserId — NOT AccountDisplayName,
+// which is a display name and will not join to anything.
+//
+let TimeToCheck = 30d;
+let UserIdentityCheck = "";
+let IPtoCheck = "";
+let OperationCheck = "";
+let WorkloadCheck = "";
+let MailboxCheck = "";
+//
+let Job = IdentityInfo | where AccountUPN contains UserIdentityCheck | where TimeGenerated >=ago(90d) | extend AccountUPN = tolower(AccountUPN)| summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles, "3.Manager", Manager) | project JobDetails, JobUserKey = AccountUPN;
+let allIPcounts = OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | extend AiIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "") | extend AiIP = iff(AiIP contains ":" and AiIP !contains "::", tostring(split(AiIP, ":")[0]), AiIP) | where isnotempty(AiIP) | summarize DaysIPSeenInOrg = dcount(bin(TimeGenerated, 1d)) by AiIP;
+let uniqueCounts = OfficeActivity | where UserId contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | extend UcIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "") | extend UcIP = iff(UcIP contains ":" and UcIP !contains "::", tostring(split(UcIP, ":")[0]), UcIP) | where isnotempty(UcIP) | summarize DaysIPSeenByUser = dcount(bin(TimeGenerated, 1d)) by UcUserKey = tolower(UserId), UcIP;
+let DistinctIDfromIP = OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where ResultStatus in~ ("Succeeded", "Success", "True") | extend DiIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "") | extend DiIP = iff(DiIP contains ":" and DiIP !contains "::", tostring(split(DiIP, ":")[0]), DiIP) | where isnotempty(DiIP) | summarize UsersWithThisIP = make_set(UserId, 100) by DiIP;
+let AllOpCounts = OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | summarize DaysOpSeenInOrg = dcount(bin(TimeGenerated, 1d)), UsersUsingOp = dcount(UserId) by AoOperation = Operation;
+let OperationCount = OfficeActivity | where UserId contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | summarize DaysOpSeenByUser = dcount(bin(TimeGenerated, 1d)) by OcUserKey = tolower(UserId), OcOperation = Operation;
+let WorkloadCountByUser = OfficeActivity | where UserId contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | summarize DaysWorkloadSeenByUser = dcount(bin(TimeGenerated, 1d)) by WcUserKey = tolower(UserId), WcWorkload = OfficeWorkload;
+let ClientAppCount = OfficeActivity | where UserId contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(ClientInfoString) | summarize DaysClientSeenByUser = dcount(bin(TimeGenerated, 1d)) by CaUserKey = tolower(UserId), CaClient = ClientInfoString;
+let SignInFromIP = SigninLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | summarize DaysUserSignedInFromIP = dcount(bin(TimeGenerated, 1d)) by SiUserKey = tolower(UserPrincipalName), SiIP = IPAddress;
+//
+OfficeActivity
+| where TimeGenerated >= ago(TimeToCheck)
+| extend CleanIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "") | extend CleanIP = iff(CleanIP contains ":" and CleanIP !contains "::", tostring(split(CleanIP, ":")[0]), CleanIP)
+| extend UserIdKey = tolower(UserId)
+| join kind=leftouter Job on $left.UserIdKey == $right.JobUserKey | join kind=leftouter allIPcounts on $left.CleanIP == $right.AiIP | join kind=leftouter uniqueCounts on $left.UserIdKey == $right.UcUserKey, $left.CleanIP == $right.UcIP | join kind=leftouter DistinctIDfromIP on $left.CleanIP == $right.DiIP
+| join kind=leftouter AllOpCounts on $left.Operation == $right.AoOperation | join kind=leftouter OperationCount on $left.UserIdKey == $right.OcUserKey, $left.Operation == $right.OcOperation | join kind=leftouter WorkloadCountByUser on $left.UserIdKey == $right.WcUserKey, $left.OfficeWorkload == $right.WcWorkload | join kind=leftouter ClientAppCount on $left.UserIdKey == $right.CaUserKey, $left.ClientInfoString == $right.CaClient | join kind=leftouter SignInFromIP on $left.UserIdKey == $right.SiUserKey, $left.CleanIP == $right.SiIP
+| where UserId contains UserIdentityCheck | where CleanIP contains IPtoCheck | where Operation contains OperationCheck | where OfficeWorkload contains WorkloadCheck | where MailboxOwnerUPN contains MailboxCheck
+| extend UsersWIPCount = array_length(UsersWithThisIP)
+| extend DaysUserSignedInFromIP = coalesce(DaysUserSignedInFromIP, 0), DaysIPSeenByUser = coalesce(DaysIPSeenByUser, 0), DaysOpSeenByUser = coalesce(DaysOpSeenByUser, 0)
+| project-rename EventTime = TimeGenerated
+| project-reorder EventTime, OfficeWorkload, Operation, RecordType, ResultStatus, UserId, UserType, JobDetails, CleanIP, DaysUserSignedInFromIP, DaysIPSeenByUser, DaysIPSeenInOrg, UsersWIPCount, UsersWithThisIP, DaysOpSeenByUser, DaysOpSeenInOrg, UsersUsingOp, DaysWorkloadSeenByUser, DaysClientSeenByUser, ClientInfoString, UserAgent, ClientProcessName, ClientVersion, MailboxOwnerUPN, AADTarget, TargetUserOrGroupName, TargetUserOrGroupType, UserSharedWith, SharingType, Site_Url, SourceFileName, SourceFileExtension, ItemName, ItemType, Parameters, ModifiedProperties, OfficeObjectId, OriginatingServer, ExternalAccess, Logon_Type, ClientIP
+| project-away TenantId, SourceSystem, Type, OfficeId, OfficeTenantId, OrganizationId, OrganizationName, SourceRecordId, InterSystemsId, IntraSystemId, AppPoolName, DataCenterSecurityEventType, InternalLogonType, LoginStatus, MachineDomainInfo, MachineId, SupportTicketId, CustomEvent, Event_Data, GenericInfo, AddOnGuid, AddonName, AddOnType, AppDistributionMode, ElevationApprovedTime, ElevationApprover, ElevationDuration, ElevationRequestId, ElevationRole, ElevationTime, EffectiveOrganization, ActorContextId, TargetContextId, AADGroupId, ApplicationId, ClientAppId, AzureADAppId, SensitivityLabelId, ListItemUniqueId, UniqueSharingId, SRPolicyId, SRPolicyName, SRRuleMatchDetails, MailboxOwnerMasterAccountSid, MailboxOwnerSid, DestMailboxOwnerMasterAccountSid, DestMailboxOwnerSid, DestMailboxId, LogonUserSid, Site_, UserKey, UserDomain, ExtendedProperties, AzureActiveDirectory_EventType, UserIdKey, JobUserKey, AiIP, UcUserKey, UcIP, DiIP, AoOperation, OcUserKey, OcOperation, WcUserKey, WcWorkload, CaUserKey, CaClient, SiUserKey, SiIP
+| sort by EventTime desc
+//| where DaysUserSignedInFromIP == 0
+//| where Operation contains "InboxRule" or Operation contains "Forward"
