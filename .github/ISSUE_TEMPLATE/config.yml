@@ -1,8 +1,0 @@
-blank_issues_enabled: true
-contact_links:
-  - name: How the queries are built
-    url: https://github.com/Ju5t4k/The-SOC-HandBook-KQL-#how-every-query-in-this-repo-is-built
-    about: The FILL IN / CONTEXT / MAIN shape, and how to read the day counts.
-  - name: Never put tenant data in an issue
-    url: https://github.com/Ju5t4k/The-SOC-HandBook-KQL-/blob/main/SECURITY.md
-    about: Redact UPNs, hostnames, public IPs and query output before posting.

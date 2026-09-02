@@ -48,9 +48,9 @@ it.
 ## Reporting a problem with a query
 
 A query that returns the wrong answer is a correctness bug, not a security
-issue — open a normal issue using the "Query correction" template. That
-includes queries that miss events, because a detection gap is worth discussing
-in the open where other people can see the reasoning.
+issue — open a normal issue. That includes queries that miss events, because a
+detection gap is worth discussing in the open where other people can see the
+reasoning.
 
 If you believe something in this repository actively creates risk for the
 people running it — a query that would leak data out of a tenant, for example —
