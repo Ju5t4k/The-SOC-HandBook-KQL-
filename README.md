@@ -5,12 +5,10 @@
 
 KQL queries for SOC analysts working in Microsoft Sentinel and Defender XDR.
 
-> **Status: empty.** The repository is set up and nothing has been added yet.
-
 ## Layout
 
 ```
-queries/    the queries, grouped however suits
+queries/    the queries — see queries/README.md for the index
 docs/       background reading and reference
 ```
 
