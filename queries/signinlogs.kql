@@ -1,4 +1,4 @@
-//SigninLogs UserPrincipal query/v20251217
+//SigninLogs UserPrincipal query
 //
 // Sign-in investigation for a user, IP or device. Fill in any of the CHECK
 // values below and run; leave them blank and it returns everything.
