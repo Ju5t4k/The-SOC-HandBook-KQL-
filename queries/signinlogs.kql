@@ -12,6 +12,30 @@
 // how many days the IP / device / location / user agent / app has been seen,
 // and which other accounts share the address.
 //
+// CHANGES SINCE v20251217 — everything else is as originally written:
+//   - Day counts use dcount(bin(TimeGenerated, 1d)) rather than
+//     dcount(datetime_part("day", TimeGenerated)). Identical results at
+//     TimeToCheck = 30d; the original silently caps at 31 and collides
+//     (3 Jan and 3 Feb are the same value) if TimeToCheck is ever raised.
+//   - make_set(Identity) in DistinctIDfromIP is capped at 100. A shared
+//     corporate egress address would otherwise make that one cell enormous.
+//   - UniqueEvents is count() not dcount(CorrelationId), which was always 1 by
+//     construction. It now means "events in this sign-in session", so it is no
+//     longer thrown away by project-away.
+//   - NewStarterCheck joins leftouter, not fullouter. fullouter emitted rows
+//     for new starters with no sign-in, which the UserPrincipalName filter
+//     further down discarded anyway.
+//   - project-reorder asks for Identity, not identity. Column names are
+//     case-sensitive, so the lowercase form matched nothing and the column was
+//     never promoted.
+//   - project-away drops DeviceShort1, not DeviceShort*. The wildcard removed
+//     DeviceShort as well, so the column project-reorder asks for never
+//     reached the output.
+//
+// STILL TO VERIFY: the two extract() regexes in NewStarterCheck were
+// transcribed from a screenshot. If the backslash escaping is wrong, JobTitle
+// and Identity return empty with no error.
+//
 let TimeToCheck = 30d;
 let UserIdentityCheck = "";
 let IPtoCheck = "";
@@ -19,26 +43,26 @@ let DeviceDetailtoCheck = "";
 //
 let Job = IdentityInfo | where AccountUPN contains UserIdentityCheck | where TimeGenerated >=ago(90d) | extend AccountUPN = tolower(AccountUPN)| summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles, "3.Manager", Manager) | project JobDetails, AccountUPN;
 let NewStarterCheck = AuditLogs | where TargetResources contains UserIdentityCheck | where TimeGenerated >ago(90d) | where OperationName == "Add user" | where TargetResources contains "AccountEnabled" | extend PropertiesString = tostring(TargetResources) | extend JobString = extract('"JobTitle.*?"', 0, PropertiesString) | extend JobTitle = extract('"newValue":"\\[\\"(.*?)\\\\"\\]"', 1, JobString) | extend UserString = extract('"DisplayName.*?"', 0, PropertiesString) | extend Identity = extract('"newValue":"\\[\\"(.*?)\\\\"\\]"', 1, UserString) | project-rename StartDate = ActivityDateTime | project StartDate, JobTitle, Identity;
-let allIPcounts = SigninLogs | where TimeGenerated >= ago(TimeToCheck) | summarize DaysIpSeenInOrg = dcount(datetime_part("day", TimeGenerated)) by IPAddress;
-let uniqueCounts = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | summarize DaysIpSeenByUser = dcount(datetime_part("day", TimeGenerated)) by IPAddress;
-let UniqueCorrelatedIDs = SigninLogs | where TimeGenerated >= ago(TimeToCheck) | summarize UniqueEvents = dcount(CorrelationId) by CorrelationId;
-let DistinctIDfromIP = SigninLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | summarize UsersWithThisIP = make_set(Identity) by IPAddress;
-let DeviceCount = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | extend DeviceString = tostring(DeviceDetail) | extend DeviceShort = extract(@"deviceId.*?browser.*?(\w+)", 0, DeviceString) | where isnotempty( DeviceShort) | summarize DeviceDayCount = dcount(datetime_part("day", TimeGenerated)) by DeviceShort;
-let UserAgentCount = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | summarize UserAgentDayCount = dcount(datetime_part("day", TimeGenerated)) by UserAgent;
-let LocationCount = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | extend LocationString = tostring(LocationDetails) | extend LocationShort = extract(@"([^,]*),([^,]*),([^,]*)",1, LocationString) | summarize DaysLocationSeenUser = dcount(datetime_part("day", TimeGenerated)) by LocationShort;
-let AppDisplayNameCount = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | summarize AppDayCount = dcount(datetime_part("day", TimeGenerated)) by AppDisplayName;
+let allIPcounts = SigninLogs | where TimeGenerated >= ago(TimeToCheck) | summarize DaysIpSeenInOrg = dcount(bin(TimeGenerated, 1d)) by IPAddress;
+let uniqueCounts = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | summarize DaysIpSeenByUser = dcount(bin(TimeGenerated, 1d)) by IPAddress;
+let UniqueCorrelatedIDs = SigninLogs | where TimeGenerated >= ago(TimeToCheck) | summarize UniqueEvents = count() by CorrelationId;
+let DistinctIDfromIP = SigninLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | summarize UsersWithThisIP = make_set(Identity, 100) by IPAddress;
+let DeviceCount = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | extend DeviceString = tostring(DeviceDetail) | extend DeviceShort = extract(@"deviceId.*?browser.*?(\w+)", 0, DeviceString) | where isnotempty( DeviceShort) | summarize DeviceDayCount = dcount(bin(TimeGenerated, 1d)) by DeviceShort;
+let UserAgentCount = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | summarize UserAgentDayCount = dcount(bin(TimeGenerated, 1d)) by UserAgent;
+let LocationCount = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | extend LocationString = tostring(LocationDetails) | extend LocationShort = extract(@"([^,]*),([^,]*),([^,]*)",1, LocationString) | summarize DaysLocationSeenUser = dcount(bin(TimeGenerated, 1d)) by LocationShort;
+let AppDisplayNameCount = SigninLogs | where UserPrincipalName contains UserIdentityCheck | where TimeGenerated >= ago(TimeToCheck) | summarize AppDayCount = dcount(bin(TimeGenerated, 1d)) by AppDisplayName;
 //
 SigninLogs
 | where TimeGenerated >= ago(TimeToCheck)
 | extend DeviceString = tostring(DeviceDetail) | extend LocationString = tostring(LocationDetails) | extend DeviceShort = extract(@"deviceId.*?browser.*?(\w+)", 0, DeviceString)
 | extend LocationString = tostring(LocationDetails) | extend LocationShort = extract(@"([^,]*),([^,]*),([^,]*)",1, LocationString)
-| join kind=fullouter NewStarterCheck on Identity | join kind=inner (allIPcounts) on IPAddress | join kind=inner (uniqueCounts) on IPAddress | join kind=leftouter (DistinctIDfromIP) on IPAddress
+| join kind=leftouter NewStarterCheck on Identity | join kind=inner (allIPcounts) on IPAddress | join kind=inner (uniqueCounts) on IPAddress | join kind=leftouter (DistinctIDfromIP) on IPAddress
 | join kind=inner (UniqueCorrelatedIDs) on CorrelationId | join kind=leftouter (DeviceCount) on DeviceShort | join kind=inner (UserAgentCount) on UserAgent | join kind=inner (LocationCount) on LocationShort | join kind=inner (AppDisplayNameCount) on AppDisplayName | join kind=leftouter Job on $left.UserPrincipalName == $right.AccountUPN
 | where UserPrincipalName contains UserIdentityCheck | where DeviceDetail contains DeviceDetailtoCheck | where IPAddress contains IPtoCheck
 | extend UsersWIPCount = array_length(UsersWithThisIP)
 | project-rename LogCreatedTime = TimeGenerated, EventTime = CreatedDateTime
 //| where CorrelationId in (UniqueCorrelatedIDs) | summarize arg_max(EventTime, *) by CorrelationId
-| project-reorder EventTime, LogCreatedTime, RiskDetail, RiskEventTypes, UsersWIPCount, UsersWithThisIP, StartDate, JobTitle, identity, JobDetails, IPAddress, DaysIpSeenInOrg, DaysIpSeenByUser, ResultType, ResultDescription, AppDayCount, AppDisplayName, DaysLocationSeenUser, LocationShort, AuthenticationDetails, DeviceDayCount, DeviceDetail, DeviceShort, UserAgentDayCount, UserAgent, MfaDetail, ConditionalAccessPolicies, ConditionalAccessStatus, CorrelationId
-| project-away TenantId, SourceSystem, Resource*, Operation*, Category, ResultSignature, DurationMs, Level, Location, AppId, AuthenticationContextClassReferences, AuthenticationProcessingDetails, AuthenticationRe*, ClientAppUsed, IsInteractive, Id, LocationDetails, NetworkLocationDetails, OriginalRequestId, ProcessingTimeInMilliseconds, RiskEventTypes_V2, RiskLevelAggregated, RiskLevelDuringSignIn, RiskState, Status, Token*, UserDisplayName, AADTenantId, UserType, HomeTenantId, UniqueTokenIdentifier, SessionLifetimePolicies, AutonomousSystemNumber, AuthenticationProtocol, Type, DeviceString, LocationString, Identity1, IPAddress1, IPAddress2, IPAddress3, CorrelationId1, UniqueEvents, UserAgent1, LocationShort1, AppDisplayName1, AlternateSignInName, SignInIdentifier, CrossTenantAccessType, ClientCredentialType, IsThroughGlobalSecureAccess, OriginalTransferMethod, IsTenantRestricted, UserId, IncomingTokenType, DeviceShort*
+| project-reorder EventTime, LogCreatedTime, RiskDetail, RiskEventTypes, UsersWIPCount, UsersWithThisIP, StartDate, JobTitle, Identity, JobDetails, IPAddress, DaysIpSeenInOrg, DaysIpSeenByUser, ResultType, ResultDescription, AppDayCount, AppDisplayName, DaysLocationSeenUser, LocationShort, AuthenticationDetails, DeviceDayCount, DeviceDetail, DeviceShort, UserAgentDayCount, UserAgent, MfaDetail, ConditionalAccessPolicies, ConditionalAccessStatus, CorrelationId
+| project-away TenantId, SourceSystem, Resource*, Operation*, Category, ResultSignature, DurationMs, Level, Location, AppId, AuthenticationContextClassReferences, AuthenticationProcessingDetails, AuthenticationRe*, ClientAppUsed, IsInteractive, Id, LocationDetails, NetworkLocationDetails, OriginalRequestId, ProcessingTimeInMilliseconds, RiskEventTypes_V2, RiskLevelAggregated, RiskLevelDuringSignIn, RiskState, Status, Token*, UserDisplayName, AADTenantId, UserType, HomeTenantId, UniqueTokenIdentifier, SessionLifetimePolicies, AutonomousSystemNumber, AuthenticationProtocol, Type, DeviceString, LocationString, Identity1, IPAddress1, IPAddress2, IPAddress3, CorrelationId1, UserAgent1, LocationShort1, AppDisplayName1, AlternateSignInName, SignInIdentifier, CrossTenantAccessType, ClientCredentialType, IsThroughGlobalSecureAccess, OriginalTransferMethod, IsTenantRestricted, UserId, IncomingTokenType, DeviceShort1
 | sort by EventTime desc
 //| extend DeviceString = tostring(DeviceDetail) | where DeviceDetail !contains ""

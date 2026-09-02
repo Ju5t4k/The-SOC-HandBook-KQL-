@@ -10,6 +10,13 @@ Notable changes to this repository. Format follows
   investigation for a user, IP or device, joined to IdentityInfo for job
   details, AuditLogs for a new-starter check, and day-counts for the address,
   device, location, user agent and application.
+
+### Fixed
+- `signinlogs.kql` — day counts now bin by day rather than counting
+  day-of-month, so `TimeToCheck` is safe to raise above 31d; `DeviceShort` and
+  `Identity` survive to the output; `UniqueEvents` counts events in a session
+  rather than always returning 1; `make_set` capped; `fullouter` join reduced to
+  `leftouter`. The changes are listed in the file header.
 - Repository scaffolding — licence, contributing guide, security policy, code
   of conduct, pull request template, CI hygiene check.
 
