@@ -1,0 +1,397 @@
+// #############################################################################
+// OFFICEACTIVITY
+//
+// The Microsoft 365 unified audit log as it lands in Sentinel: Exchange Online,
+// SharePoint, OneDrive, Teams and the Azure AD record type. This is where a
+// compromised account's actual damage happens — mail rules, forwarding,
+// delegation, mass download, external sharing.
+//
+// THE SHAPE OF THIS TABLE
+//   OfficeActivity is wide and sparse. Which columns are populated depends
+//   entirely on OfficeWorkload and RecordType, so a query that works beautifully
+//   for Exchange returns blank columns for SharePoint. Filter by workload first.
+//
+//     UserId            the acting account, as a UPN. Usable directly as a join
+//                       key, unlike CloudAppEvents.AccountDisplayName.
+//     ClientIP          the source address — often with a port appended, and
+//                       for IPv6 wrapped in brackets. Strip it before joining.
+//     Operation         the verb. Exchange operations are PowerShell cmdlet
+//                       names; SharePoint operations are FileAccessed-style.
+//     Parameters        a JSON ARRAY of {Name, Value} for Exchange cmdlets.
+//                       This is where the actual rule definition lives.
+//     ModifiedProperties, OfficeObjectId, Site_Url, SourceFileName
+//
+// IF YOU ARE ON DEFENDER XDR INSTEAD
+//   The equivalent table is CloudAppEvents. Same events, different shape:
+//   Parameters becomes RawEventData, and the acting account is in
+//   RawEventData.UserId — NOT AccountDisplayName, which is a display name and
+//   will not join to anything.
+// #############################################################################
+
+
+// -----------------------------------------------------------------------------
+// QUERY:    OfficeActivity — full activity investigation
+// VERSION:  2026.09.02
+// TABLES:   OfficeActivity, SigninLogs, IdentityInfo
+// ATT&CK:   T1078.004 Cloud Accounts, T1114 Email Collection,
+//           T1530 Data from Cloud Storage
+//
+// FILL IN:
+//   UserCheck for one account, IPtoCheck for one address, OperationCheck for
+//   one kind of activity. WorkloadCheck narrows to "Exchange", "SharePoint",
+//   "OneDrive", "MicrosoftTeams" or "AzureActiveDirectory".
+//
+// WHAT YOU GET:
+//   Every audited action for the target, with each row carrying:
+//     ActorJob                who the account belongs to
+//     DaysIPSeenInOrg         how many days that address has appeared anywhere
+//     DaysIPSeenByUser        how many days it has appeared for this account
+//     SignInsFromIP           whether the account actually SIGNED IN from that
+//                             address, and on how many days
+//     DaysOperationSeenByUser how routine this operation is for this person
+//     UsersFromThisIP         which other accounts act from the same address
+//
+// HOW TO READ IT:
+//   SignInsFromIP is the column that catches delegated and token-based access.
+//   Activity from an address with no matching interactive sign-in means the
+//   session was established some other way — a stolen token, a mailbox
+//   delegation, or an application acting on the user's behalf. That is normal
+//   for some service traffic and is the whole finding for a compromised
+//   mailbox.
+//   DaysOperationSeenByUser separates the administrator who runs Set-Mailbox
+//   every week from the user who has just run it for the first time ever.
+//
+// MODIFY IT:
+//   - Set WorkloadCheck to "Exchange" and OperationCheck to "Rule" for inbox
+//     rule work; the dedicated query below does that with the rule contents
+//     unpacked.
+//   - Set OperationCheck to "FileDownloaded" and pair with a bin() summarize to
+//     find bulk collection.
+//   - Add `| where SignInsFromIP == 0` to keep only activity with no sign-in
+//     behind it.
+//   - Add `| where DaysOperationSeenByUser <= 1` for first-time-ever actions.
+//   - Change ResultStatus to `!= "Succeeded"` to see what was attempted and
+//     refused.
+// -----------------------------------------------------------------------------
+// ===== FILL IN — leave blank for "everything" ================================
+let TimeToCheck     = 30d;
+let BaselineToCheck = 90d;
+let UserCheck       = "";    // acting account, UPN or part of one
+let IPtoCheck       = "";    // source address or prefix
+let OperationCheck  = "";    // e.g. "InboxRule", "FileDownloaded", "Add-Mailbox"
+let WorkloadCheck   = "";    // Exchange / SharePoint / OneDrive / MicrosoftTeams
+// =============================================================================
+
+// --- CONTEXT: who is the acting account? (needs UEBA or MDI) -----------------
+let Job = IdentityInfo
+    | where TimeGenerated > ago(BaselineToCheck)
+    | summarize arg_max(TimeGenerated, *) by AccountObjectId
+    | extend ActorJob = bag_pack(
+          "1.JobTitle",   JobTitle,
+          "2.Department", Department,
+          "3.Manager",    tostring(Manager),
+          "4.Roles",      tostring(AssignedRoles),
+          "5.Enabled",    IsAccountEnabled)
+    | project JobUserKey = tolower(AccountUPN), ActorJob;
+
+// --- CONTEXT: how well known is the source address? --------------------------
+// ClientIP arrives as "1.2.3.4:52133" or "[2001:db8::1]:443". Strip the port and
+// the brackets before it is used as a join key, or nothing will ever match.
+// The ":" test below keeps compressed IPv6 ("::") intact. A fully-written IPv6
+// address with no brackets and no "::" would be truncated — rare, because the
+// unified audit log brackets IPv6 whenever it appends a port.
+let CleanOfficeIP = OfficeActivity
+    | where TimeGenerated > ago(BaselineToCheck)
+    | extend OrgIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "")
+    | extend OrgIP = iff(OrgIP contains ":" and OrgIP !contains "::",
+                         tostring(split(OrgIP, ":")[0]), OrgIP)
+    | summarize DaysIPSeenInOrg = dcount(bin(TimeGenerated, 1d)),
+                UsersFromThisIP = make_set(UserId, 20)
+            by OrgIP;
+
+let UserIPHistory = OfficeActivity
+    | where TimeGenerated > ago(BaselineToCheck)
+    | where UserId contains UserCheck
+    | extend UserIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "")
+    | extend UserIP = iff(UserIP contains ":" and UserIP !contains "::",
+                          tostring(split(UserIP, ":")[0]), UserIP)
+    | summarize DaysIPSeenByUser = dcount(bin(TimeGenerated, 1d))
+            by SrcUserKey = tolower(UserId), UserIP;
+
+// --- CONTEXT: did the account actually sign in from that address? ------------
+let SignInHistory = SigninLogs
+    | where TimeGenerated > ago(BaselineToCheck)
+    | where ResultType == "0"
+    | summarize SignInsFromIP = dcount(bin(TimeGenerated, 1d))
+            by SiUserKey = tolower(UserPrincipalName), SiIP = IPAddress;
+
+// --- CONTEXT: how routine is this operation for this person? -----------------
+let OperationHistory = OfficeActivity
+    | where TimeGenerated > ago(BaselineToCheck)
+    | where UserId contains UserCheck
+    | summarize DaysOperationSeenByUser = dcount(bin(TimeGenerated, 1d))
+            by OpUserKey = tolower(UserId), OpName = Operation;
+
+// --- MAIN --------------------------------------------------------------------
+OfficeActivity
+| where TimeGenerated > ago(TimeToCheck)
+| where UserId contains UserCheck
+| where Operation contains OperationCheck
+| where OfficeWorkload contains WorkloadCheck
+| extend CleanIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "")
+| extend CleanIP = iff(CleanIP contains ":" and CleanIP !contains "::",
+                       tostring(split(CleanIP, ":")[0]), CleanIP)
+| where CleanIP contains IPtoCheck
+| extend UserKey = tolower(UserId)
+| join kind=leftouter Job              on $left.UserKey == $right.JobUserKey
+| join kind=leftouter CleanOfficeIP    on $left.CleanIP == $right.OrgIP
+| join kind=leftouter UserIPHistory    on $left.UserKey == $right.SrcUserKey,
+                                          $left.CleanIP == $right.UserIP
+| join kind=leftouter SignInHistory    on $left.UserKey == $right.SiUserKey,
+                                          $left.CleanIP == $right.SiIP
+| join kind=leftouter OperationHistory on $left.UserKey == $right.OpUserKey,
+                                          $left.Operation == $right.OpName
+| extend SignInsFromIP           = coalesce(SignInsFromIP, 0),
+         DaysIPSeenByUser        = coalesce(DaysIPSeenByUser, 0),
+         DaysOperationSeenByUser = coalesce(DaysOperationSeenByUser, 0)
+| project-reorder TimeGenerated, OfficeWorkload, Operation, ResultStatus,
+                  UserId, UserType, ActorJob,
+                  CleanIP, SignInsFromIP, DaysIPSeenByUser, DaysIPSeenInOrg,
+                  UsersFromThisIP, DaysOperationSeenByUser,
+                  MailboxOwnerUPN, TargetUserOrGroupName, Site_Url,
+                  SourceFileName, OfficeObjectId, ClientInfoString, Parameters
+| project-away JobUserKey, OrgIP, SrcUserKey, UserIP, SiUserKey, SiIP,
+               OpUserKey, OpName, UserKey
+| sort by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+// QUERY:    OfficeActivity — mailbox rules, forwarding and delegation, unpacked
+// VERSION:  2026.09.02
+// TABLES:   OfficeActivity, SigninLogs
+// ATT&CK:   T1114.003 Email Forwarding Rule, T1098.002 Additional Email
+//           Delegate Permissions, T1564.008 Email Hiding Rules
+//
+// FILL IN:
+//   Nothing, to sweep the tenant. Or UserCheck for one account, or
+//   MailboxCheck for one mailbox regardless of who acted on it.
+//
+// WHAT YOU GET:
+//   Every rule, forwarding and delegation change, with the rule DEFINITION
+//   pulled out of the Parameters array into readable columns rather than left
+//   as a JSON blob. Plus the source address, and whether the actor actually
+//   signed in from it.
+//
+// HOW TO READ IT:
+//   ForwardTo, RedirectTo and ForwardAsAttachmentTo pointing at an external
+//   domain is exfiltration and needs no further confirmation.
+//   MoveToFolder set to Deleted Items, RSS Feeds, Conversation History or
+//   Archive, combined with SubjectContains or BodyContains holding words like
+//   "invoice", "payment", "password", "security" — that is a business email
+//   compromise hiding the replies from the real owner. It is quiet, it is
+//   deliberate, and it is often the only artefact left.
+//   Actor different from MailboxOwnerUPN means somebody else changed this
+//   mailbox. Sometimes a helpdesk, sometimes not.
+//   SignInsFromIP of 0 on a rule change means whoever did it never signed in
+//   from there — delegated access, or a token.
+//
+// MODIFY IT:
+//   - Add `| where ExternalForward == true` to keep only rules that send mail
+//     outside the tenant.
+//   - Add `| where HidingRule == true` for the delete/move-and-hide pattern
+//     without the forwarding.
+//   - Widen RuleOperations with "Add-MailboxPermission",
+//     "Add-RecipientPermission" and "Set-MailboxFolderPermission" to cover
+//     delegation-based access, which leaves no rule behind at all.
+//   - Change InternalDomains to your own accepted domains — the external-forward
+//     test is only as good as that list.
+//   - Drop TimeToCheck to 24h and leave every check blank as a daily sweep.
+// -----------------------------------------------------------------------------
+// ===== FILL IN — leave blank for "everything" ================================
+let TimeToCheck      = 30d;
+let BaselineToCheck  = 90d;
+let UserCheck        = "";   // who made the change
+let MailboxCheck     = "";   // which mailbox it was made on
+let InternalDomains  = dynamic(["contoso.com", "contoso.onmicrosoft.com"]);
+let RuleOperations   = dynamic([
+      "New-InboxRule", "Set-InboxRule", "Enable-InboxRule", "UpdateInboxRules",
+      "Set-Mailbox", "Set-MailboxJunkEmailConfiguration",
+      "Add-MailboxPermission", "Add-RecipientPermission",
+      "Set-MailboxFolderPermission", "Add-MailboxFolderPermission",
+      "New-TransportRule", "Set-TransportRule"]);
+let HidingFolders    = dynamic(["Deleted Items", "RSS Feeds", "Conversation History",
+                                "Junk Email", "Archive", "Notes"]);
+// =============================================================================
+
+// --- CONTEXT: did the actor sign in from the address they acted from? --------
+let SignInHistory = SigninLogs
+    | where TimeGenerated > ago(BaselineToCheck)
+    | where ResultType == "0"
+    | summarize SignInsFromIP = dcount(bin(TimeGenerated, 1d))
+            by SiUserKey = tolower(UserPrincipalName), SiIP = IPAddress;
+
+// --- MAIN --------------------------------------------------------------------
+OfficeActivity
+| where TimeGenerated > ago(TimeToCheck)
+| where OfficeWorkload =~ "Exchange"
+| where Operation in~ (RuleOperations)
+| where UserId contains UserCheck
+| where MailboxOwnerUPN contains MailboxCheck
+| extend CleanIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "")
+| extend CleanIP = iff(CleanIP contains ":" and CleanIP !contains "::",
+                       tostring(split(CleanIP, ":")[0]), CleanIP)
+// Parameters is a JSON array of {Name, Value}. Turn it into a property bag so
+// each cmdlet argument can be read by name instead of by eye.
+// An empty array would make mv-apply drop the row entirely, so substitute a
+// one-element array and let those events through with a blank bag.
+| extend ParamList = iff(array_length(todynamic(Parameters)) > 0,
+                         todynamic(Parameters), dynamic([{}]))
+| mv-apply P = ParamList on (
+      summarize ParamBag = make_bag(bag_pack(tostring(P.Name), tostring(P.Value)))
+  )
+| extend RuleName        = coalesce(tostring(ParamBag.Name), tostring(ParamBag.Identity)),
+         ForwardTo       = tostring(ParamBag.ForwardTo),
+         RedirectTo      = tostring(ParamBag.RedirectTo),
+         ForwardAsAttach = tostring(ParamBag.ForwardAsAttachmentTo),
+         SmtpForwarding  = tostring(ParamBag.ForwardingSmtpAddress),
+         AddressForward  = tostring(ParamBag.ForwardingAddress),
+         MoveToFolder    = tostring(ParamBag.MoveToFolder),
+         DeleteMessage   = tostring(ParamBag.DeleteMessage),
+         MarkAsRead      = tostring(ParamBag.MarkAsRead),
+         StopProcessing  = tostring(ParamBag.StopProcessingRules),
+         SubjectContains = tostring(ParamBag.SubjectContainsWords),
+         BodyContains    = tostring(ParamBag.BodyContainsWords),
+         FromAddress     = tostring(ParamBag.From),
+         GrantedTo       = coalesce(tostring(ParamBag.User), tostring(ParamBag.Trustee)),
+         GrantedRights   = coalesce(tostring(ParamBag.AccessRights),
+                                    tostring(ParamBag.AccessRight))
+| extend AllForwardTargets = strcat(ForwardTo, " ", RedirectTo, " ", ForwardAsAttach,
+                                    " ", SmtpForwarding, " ", AddressForward)
+| extend ExternalForward = isnotempty(trim(" ", AllForwardTargets))
+                       and not(AllForwardTargets has_any (InternalDomains)),
+         HidingRule      = MoveToFolder has_any (HidingFolders)
+                        or DeleteMessage =~ "True"
+                        or (MarkAsRead =~ "True" and isnotempty(SubjectContains)),
+         ThirdParty      = tolower(UserId) != tolower(MailboxOwnerUPN)
+                       and isnotempty(MailboxOwnerUPN)
+| extend UserKey = tolower(UserId)
+| join kind=leftouter SignInHistory on $left.UserKey == $right.SiUserKey,
+                                       $left.CleanIP == $right.SiIP
+| extend SignInsFromIP = coalesce(SignInsFromIP, 0)
+| project TimeGenerated, Operation, ResultStatus,
+          ExternalForward, HidingRule, ThirdParty,
+          UserId, MailboxOwnerUPN, CleanIP, SignInsFromIP,
+          RuleName, AllForwardTargets, MoveToFolder, DeleteMessage, MarkAsRead,
+          StopProcessing, SubjectContains, BodyContains, FromAddress,
+          GrantedTo, GrantedRights,
+          ClientInfoString, OriginatingServer, ParamBag
+| sort by ExternalForward desc, HidingRule desc, TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+// QUERY:    OfficeActivity — file access, download and sharing burst
+// VERSION:  2026.09.02
+// TABLES:   OfficeActivity, SigninLogs
+// ATT&CK:   T1530 Data from Cloud Storage, T1213.002 Sharepoint,
+//           T1567.002 Exfiltration to Cloud Storage
+//
+// FILL IN:
+//   Nothing, for a tenant-wide burst sweep. UserCheck to profile one account,
+//   SiteCheck to watch one site collection.
+//
+// WHAT YOU GET:
+//   One row per account per site per time bucket, with the volume, the distinct
+//   files, the file types, whether anything was shared externally or made
+//   anonymous, and how that volume compares to the same account's own daily
+//   average across the baseline.
+//
+// HOW TO READ IT:
+//   VolumeVsNormal is the column that decides it. Somebody downloading 400
+//   files is meaningless if they download 400 files every day; the same 400 is
+//   an incident if they normally touch 12. Absolute thresholds produce a
+//   permanent backlog of the same five people. Ratios do not.
+//   ExternalShares and AnonymousLinks are separate from volume and worse — a
+//   single anonymous link on the right document beats a thousand downloads.
+//
+// MODIFY IT:
+//   - Set Bucket to 1d for slow collection over weeks rather than a smash-and-
+//     grab in an hour.
+//   - Raise MinFiles when sweeping a large tenant; drop it to 1 when
+//     investigating a named account.
+//   - Add `| where AnonymousLinks > 0` to skip straight to anonymous sharing.
+//   - Add a `| where FileTypes has_any (dynamic(["pst","zip","7z","kdbx"]))`
+//     filter to focus on archive and credential-store extensions.
+//   - Swap the `by` clause from Site_Url to SourceFileExtension to see what KIND
+//     of data is moving rather than where it is moving from.
+// -----------------------------------------------------------------------------
+// ===== FILL IN — leave blank for "everything" ================================
+let TimeToCheck     = 7d;
+let BaselineToCheck = 30d;
+let UserCheck       = "";
+let SiteCheck       = "";
+let Bucket          = 1h;
+let MinFiles        = 50;    // ignore anything quieter than this
+let FileOperations  = dynamic(["FileDownloaded", "FileAccessed", "FileSyncDownloadedFull",
+                               "FileSyncDownloadedPartial", "FilePreviewed",
+                               "FileCopied", "FileMoved"]);
+let ShareOperations = dynamic(["SharingSet", "SharingInvitationCreated",
+                               "AnonymousLinkCreated", "AnonymousLinkUsed",
+                               "SecureLinkCreated", "AddedToSecureLink",
+                               "CompanyLinkCreated"]);
+// =============================================================================
+
+// --- CONTEXT: what is normal daily volume for this account? ------------------
+let NormalVolume = OfficeActivity
+    | where TimeGenerated > ago(BaselineToCheck)
+    | where OfficeWorkload in~ ("SharePoint", "OneDrive")
+    | where Operation in~ (FileOperations)
+    | where UserId contains UserCheck
+    | summarize DailyFiles = count() by NvUserKey = tolower(UserId), Day = bin(TimeGenerated, 1d)
+    | summarize NormalFilesPerDay = avg(DailyFiles), PeakFilesPerDay = max(DailyFiles)
+            by NvUserKey;
+
+// --- CONTEXT: where does this account normally sign in from? -----------------
+let SignInHistory = SigninLogs
+    | where TimeGenerated > ago(BaselineToCheck)
+    | where ResultType == "0"
+    | summarize KnownSignInIPs = make_set(IPAddress, 30)
+            by SiUserKey = tolower(UserPrincipalName);
+
+// --- MAIN --------------------------------------------------------------------
+OfficeActivity
+| where TimeGenerated > ago(TimeToCheck)
+| where OfficeWorkload in~ ("SharePoint", "OneDrive")
+| where Operation in~ (FileOperations) or Operation in~ (ShareOperations)
+| where UserId contains UserCheck
+| where Site_Url contains SiteCheck
+| extend CleanIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "")
+| extend CleanIP = iff(CleanIP contains ":" and CleanIP !contains "::",
+                       tostring(split(CleanIP, ":")[0]), CleanIP)
+| summarize Files           = countif(Operation in~ (FileOperations)),
+            DistinctFiles   = dcountif(OfficeObjectId, Operation in~ (FileOperations)),
+            ExternalShares  = countif(Operation in~ (ShareOperations)),
+            // `has` matches whole terms, and "AnonymousLinkCreated" is one
+            // term — this has to be `contains`.
+            AnonymousLinks  = countif(Operation contains "AnonymousLink"),
+            Operations      = make_set(Operation, 15),
+            FileTypes       = make_set(SourceFileExtension, 15),
+            SampleFiles     = make_set(SourceFileName, 15),
+            SourceIPs       = make_set(CleanIP, 10),
+            UserAgents      = make_set(UserAgent, 5),
+            FirstSeen       = min(TimeGenerated),
+            LastSeen        = max(TimeGenerated)
+        by UserKey = tolower(UserId), UserId, Site_Url, TimeBucket = bin(TimeGenerated, Bucket)
+| where Files >= MinFiles or AnonymousLinks > 0 or ExternalShares > 0
+| join kind=leftouter NormalVolume  on $left.UserKey == $right.NvUserKey
+| join kind=leftouter SignInHistory on $left.UserKey == $right.SiUserKey
+// coalesce, not max_of: an account with no baseline has a NULL average, and
+// max_of(null, 1.0) is null, which would blank the whole column.
+| extend VolumeVsNormal = round(todouble(Files) / coalesce(NormalFilesPerDay, 1.0), 1)
+// Every source address in this bucket the account has never signed in from.
+| extend UnknownIPs = set_difference(SourceIPs, coalesce(KnownSignInIPs, dynamic([])))
+| project TimeBucket, UserId, Files, DistinctFiles, VolumeVsNormal,
+          NormalFilesPerDay = round(NormalFilesPerDay, 1), PeakFilesPerDay,
+          AnonymousLinks, ExternalShares, Site_Url,
+          Operations, FileTypes, SampleFiles,
+          SourceIPs, UnknownIPs, UserAgents, FirstSeen, LastSeen
+| sort by AnonymousLinks desc, VolumeVsNormal desc, Files desc

@@ -1,0 +1,280 @@
+// #############################################################################
+// AUDITLOGS
+//
+// Entra ID directory changes. If SigninLogs tells you an attacker got in,
+// AuditLogs tells you what they did once they were there — and what they left
+// behind so they can come back.
+//
+// THE SHAPE OF THIS TABLE
+//   AuditLogs is mostly dynamic columns, and that is where every useful field
+//   lives:
+//
+//     InitiatedBy       who did it. `.user.userPrincipalName` for a person,
+//                       `.app.displayName` for an application or script.
+//                       `.user.ipAddress` is the source address.
+//     TargetResources   an ARRAY of what was acted on. mv-expand it. Each entry
+//                       has `.userPrincipalName`, `.displayName`, `.type` and a
+//                       `.modifiedProperties` array of before/after values.
+//     AdditionalDetails a second bag of context that varies by operation.
+//
+//   Never string-match the raw JSON of TargetResources. It finds the right
+//   event and the wrong field, and it breaks the moment Microsoft reorders a
+//   property.
+//
+// THE ONE HABIT THAT MATTERS
+//   A directory change is only half a finding. The other half is the sign-in
+//   that made it. Every query here joins the actor back to SigninLogs so you
+//   can see whether the person who added that role was themselves signing in
+//   from somewhere new.
+// #############################################################################
+
+
+// -----------------------------------------------------------------------------
+// QUERY:    AuditLogs — full directory-change investigation
+// VERSION:  2026.09.02
+// TABLES:   AuditLogs, SigninLogs, IdentityInfo
+// ATT&CK:   T1098 Account Manipulation, T1136 Create Account,
+//           T1556 Modify Authentication Process
+//
+// FILL IN:
+//   ActorCheck for changes made BY someone, TargetCheck for changes made TO
+//   someone. Fill in both to answer "did this person change that person".
+//   OperationCheck narrows to a kind of change: "role", "password",
+//   "credential", "consent", "policy".
+//
+// WHAT YOU GET:
+//   Every directory change matching the filters, expanded so one row is one
+//   target, with:
+//     Actor / ActorIP        who made the change and from where
+//     ActorJob               their job title, department, roles
+//     Target / TargetType    what was changed
+//     ChangedProperties      the property names that actually moved
+//     OldValue / NewValue    before and after, extracted from
+//                            modifiedProperties rather than read out of raw JSON
+//     ActorSignInsFromIP     how many days the actor has signed in from that
+//                            same address in the baseline window
+//     ActorChangesInWindow   how many changes this actor made in total
+//
+// HOW TO READ IT:
+//   ActorSignInsFromIP is the column that separates an administrator doing
+//   their job from an attacker using their account. An admin makes changes
+//   from the address they always sign in from. A 0 or 1 here on a
+//   privilege-granting operation is the finding.
+//   ActorChangesInWindow spikes when an attacker is establishing persistence —
+//   they do not make one change, they make eight in four minutes.
+//   OldValue and NewValue are what you paste into the ticket. "Role changed"
+//   is not a finding; "added to Global Administrator at 03:14" is.
+//
+// MODIFY IT:
+//   - Set OperationCheck to "password" or "credential" and pair with the
+//     SigninLogs investigation query — a credential change straight after a
+//     sign-in from a new country is account takeover, in two queries.
+//   - Set OperationCheck to "consent" for OAuth application abuse.
+//   - Set OperationCheck to "Conditional Access" to see policy being weakened.
+//   - Add `| where Result != "success"` to find changes that were ATTEMPTED and
+//     blocked — a much quieter signal, and often the earlier one.
+//   - Add `| where ActorSignInsFromIP <= 1` to keep only changes made from an
+//     address the actor does not normally use.
+//   - Change ActorIsApp to filter on it: application-initiated changes with no
+//     interactive sign-in behind them are how service principal backdoors look.
+// -----------------------------------------------------------------------------
+// ===== FILL IN — leave blank for "everything" ================================
+let TimeToCheck     = 30d;   // the window you are investigating
+let BaselineToCheck = 90d;   // how far back the actor's normal is measured
+let ActorCheck      = "";    // who made the change, UPN or part of one
+let TargetCheck     = "";    // who or what was changed
+let OperationCheck  = "";    // e.g. "role", "password", "consent", "policy"
+let CategoryCheck   = "";    // e.g. "UserManagement", "ApplicationManagement"
+let IPtoCheck       = "";    // the actor's source address
+// =============================================================================
+
+// --- CONTEXT: who is the actor? (needs UEBA or MDI) --------------------------
+let Job = IdentityInfo
+    | where TimeGenerated > ago(BaselineToCheck)
+    | summarize arg_max(TimeGenerated, *) by AccountObjectId
+    | extend ActorJob = bag_pack(
+          "1.JobTitle",   JobTitle,
+          "2.Department", Department,
+          "3.Manager",    tostring(Manager),
+          "4.Roles",      tostring(AssignedRoles),
+          "5.Enabled",    IsAccountEnabled)
+    | project JobUserKey = tolower(AccountUPN), ActorJob;
+
+// --- CONTEXT: is the actor signing in from where they normally do? -----------
+let ActorIPHistory = SigninLogs
+    | where TimeGenerated > ago(BaselineToCheck)
+    | where ResultType == "0"
+    | summarize ActorSignInsFromIP = dcount(bin(TimeGenerated, 1d))
+            by SiUserKey = tolower(UserPrincipalName), SiIP = IPAddress;
+
+// --- CONTEXT: how busy was this actor? Persistence arrives in bursts ---------
+let ActorVolume = AuditLogs
+    | where TimeGenerated > ago(TimeToCheck)
+    | extend AvActor = tolower(coalesce(tostring(InitiatedBy.user.userPrincipalName),
+                                        tostring(InitiatedBy.app.displayName)))
+    | where isnotempty(AvActor)
+    | summarize ActorChangesInWindow = count(),
+                ActorOperationTypes  = dcount(OperationName)
+            by AvActor;
+
+// --- MAIN --------------------------------------------------------------------
+AuditLogs
+| where TimeGenerated > ago(TimeToCheck)
+| where OperationName contains OperationCheck
+| where Category contains CategoryCheck
+| extend Actor      = coalesce(tostring(InitiatedBy.user.userPrincipalName),
+                               tostring(InitiatedBy.app.displayName)),
+         ActorIP    = tostring(InitiatedBy.user.ipAddress),
+         ActorIsApp = isempty(tostring(InitiatedBy.user.userPrincipalName)),
+         ActorAppId = tostring(InitiatedBy.app.appId)
+| where Actor contains ActorCheck
+| where ActorIP contains IPtoCheck
+// One row per target. An operation can touch several objects at once, and
+// collapsing them into one row is how you miss the second one.
+| mv-expand TargetResources
+| extend Target     = coalesce(tostring(TargetResources.userPrincipalName),
+                               tostring(TargetResources.displayName)),
+         TargetType = tostring(TargetResources.type),
+         TargetId   = tostring(TargetResources.id)
+| where Target contains TargetCheck
+// modifiedProperties is an array of {displayName, oldValue, newValue}. Expand
+// it so a role name or a policy value lands in its own column instead of being
+// buried in a blob you have to open row by row.
+// mv-apply over an EMPTY array drops the row, and plenty of operations carry no
+// modifiedProperties at all. Substitute a one-element array so those events
+// survive with blank values instead of vanishing.
+| extend PropList = iff(array_length(todynamic(TargetResources.modifiedProperties)) > 0,
+                        todynamic(TargetResources.modifiedProperties),
+                        dynamic([{}]))
+| mv-apply Prop = PropList on (
+      summarize ChangedProperties = make_set(tostring(Prop.displayName), 10),
+                OldValues         = make_set(trim(@'"', tostring(Prop.oldValue)), 10),
+                NewValues         = make_set(trim(@'"', tostring(Prop.newValue)), 10)
+  )
+| extend ActorKey = tolower(Actor)
+| join kind=leftouter Job            on $left.ActorKey == $right.JobUserKey
+| join kind=leftouter ActorVolume    on $left.ActorKey == $right.AvActor
+| join kind=leftouter ActorIPHistory on $left.ActorKey == $right.SiUserKey,
+                                       $left.ActorIP  == $right.SiIP
+| extend ActorSignInsFromIP = coalesce(ActorSignInsFromIP, 0)
+| project TimeGenerated, OperationName, Category, Result, ResultReason,
+          Actor, ActorJob, ActorIP, ActorSignInsFromIP,
+          ActorChangesInWindow, ActorOperationTypes, ActorIsApp, ActorAppId,
+          Target, TargetType,
+          ChangedProperties = strcat_array(ChangedProperties, ", "),
+          OldValue          = strcat_array(OldValues, ", "),
+          NewValue          = strcat_array(NewValues, ", "),
+          TargetId, CorrelationId, Id
+| sort by TimeGenerated desc
+
+
+// -----------------------------------------------------------------------------
+// QUERY:    AuditLogs — privilege and credential timeline for one account
+// VERSION:  2026.09.02
+// TABLES:   AuditLogs, SigninLogs
+// ATT&CK:   T1098.001 Additional Cloud Credentials, T1098.003 Additional Cloud
+//           Roles, T1556.006 Multi-Factor Authentication
+//
+// FILL IN:
+//   TargetCheck with the account you are investigating. Leave ActorCheck blank
+//   — you want to see everyone who has touched it, including the account
+//   itself.
+//
+// WHAT YOU GET:
+//   Everything that has happened TO an account and everything that account has
+//   done to the directory, on one timeline, restricted to the operations that
+//   actually change someone's power or their ability to authenticate. Sign-ins
+//   by the same account are folded into the same timeline so you can see the
+//   sequence rather than two separate tabs.
+//
+// HOW TO READ IT:
+//   Read it as a story, top to bottom, oldest first. The sequences that matter:
+//     sign-in from a new address  ->  MFA method registered      = takeover
+//     account created             ->  role assigned within 1h    = persistence
+//     app registered              ->  secret added -> SP sign-in = MFA-free
+//                                                                  backdoor
+//     password reset by an admin  ->  no sign-in by that admin   = the admin
+//                                                                  account is
+//                                                                  the problem
+//   Direction tells you which way the change went: "ByAccount" is the account
+//   acting, "ToAccount" is something being done to it.
+//
+// MODIFY IT:
+//   - Widen OpsOfInterest to `dynamic([""])` to see every operation rather than
+//     the security-relevant subset — noisier, but nothing is hidden.
+//   - Remove the SigninLogs leg to get a pure directory-change timeline.
+//   - Set TargetCheck to a group name rather than a UPN to follow a privileged
+//     group instead of a person.
+//   - Change SignInFilter to `!= "0"` to put failed sign-ins on the timeline —
+//     useful when the story starts with someone guessing.
+// -----------------------------------------------------------------------------
+// ===== FILL IN ===============================================================
+let TimeToCheck  = 30d;
+let TargetCheck  = "";       // the account this timeline is about
+let ActorCheck   = "";       // optional: only changes by this actor
+let SignInFilter = "0";      // "0" = successful sign-ins only, "" = all
+let OpsOfInterest = dynamic([
+      "Add member to role", "Remove member from role", "Add eligible member to role",
+      "Update user", "Add user", "Delete user", "Disable account", "Enable account",
+      "Reset user password", "Change user password",
+      "User registered security info", "User changed default security info",
+      "User deleted security info", "Admin registered security info",
+      "Add service principal", "Add service principal credentials",
+      "Add application", "Update application", "Add owner to application",
+      "Consent to application", "Add delegated permission grant",
+      "Add app role assignment to service principal",
+      "Add member to group", "Add owner to group",
+      "Update conditional access policy", "Add conditional access policy",
+      "Delete conditional access policy"]);
+// =============================================================================
+
+union isfuzzy=true
+    (
+    AuditLogs
+    | where TimeGenerated > ago(TimeToCheck)
+    | where OperationName has_any (OpsOfInterest)
+    | extend Actor   = coalesce(tostring(InitiatedBy.user.userPrincipalName),
+                                tostring(InitiatedBy.app.displayName)),
+             ActorIP = tostring(InitiatedBy.user.ipAddress)
+    | mv-expand TargetResources
+    | extend Target = coalesce(tostring(TargetResources.userPrincipalName),
+                               tostring(TargetResources.displayName))
+    | where Actor contains ActorCheck
+    | where Target contains TargetCheck or Actor contains TargetCheck
+    | extend Direction = iff(Actor contains TargetCheck and isnotempty(TargetCheck),
+                             "ByAccount", "ToAccount")
+    | extend PropList = iff(array_length(todynamic(TargetResources.modifiedProperties)) > 0,
+                            todynamic(TargetResources.modifiedProperties),
+                            dynamic([{}]))
+    | mv-apply Prop = PropList on (
+          summarize Changed = make_set(tostring(Prop.displayName), 6),
+                    NewVals = make_set(trim(@'"', tostring(Prop.newValue)), 6)
+      )
+    | extend EventType = "Directory",
+             Detail    = strcat(OperationName, " | ", Result,
+                                " | target=", Target,
+                                " | ", strcat_array(Changed, ","),
+                                " -> ", strcat_array(NewVals, ","))
+    | project TimeGenerated, EventType, Direction, Actor, ActorIP, Target, Detail,
+              OperationName, Category, Result, CorrelationId
+    ),
+    (
+    SigninLogs
+    | where TimeGenerated > ago(TimeToCheck)
+    | where UserPrincipalName contains TargetCheck
+    // `contains "0"` would also match 50053 and 50403 — compare exactly.
+    | where isempty(SignInFilter) or ResultType == SignInFilter
+    | extend EventType = "SignIn", Direction = "ByAccount",
+             Actor   = UserPrincipalName,
+             ActorIP = IPAddress,
+             Target  = "",
+             Detail  = strcat("sign-in ", ResultType, " ", ResultDescription,
+                              " | ", AppDisplayName,
+                              " | ", tostring(LocationDetails.countryOrRegion),
+                              " | ", tostring(DeviceDetail.operatingSystem),
+                              " ", tostring(DeviceDetail.browser))
+    | project TimeGenerated, EventType, Direction, Actor, ActorIP, Target, Detail,
+              OperationName = AppDisplayName, Category = "SignIn",
+              Result = ResultType, CorrelationId
+    )
+| sort by TimeGenerated asc

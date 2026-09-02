@@ -1,0 +1,65 @@
+name: Query request
+description: Ask for a query that does not exist yet
+labels: ["new query"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The most useful thing you can give here is **the question you were
+        actually asked**, in the words it arrived in. A query built from a real
+        ticket beats one built from a technique ID.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: The question you need answered
+      description: In plain English, as it would arrive on a ticket.
+      placeholder: >
+        "Finance say they got a suspicious email and one person clicked it —
+        did anything happen to that account afterwards?"
+    validations:
+      required: true
+
+  - type: input
+    id: starting_point
+    attributes:
+      label: What you start with
+      description: The identifier you would have in hand when you run it.
+      placeholder: a UPN, an IP, a device name, a message ID
+    validations:
+      required: true
+
+  - type: textarea
+    id: tables
+    attributes:
+      label: Which tables you think it needs
+      description: Optional. A best guess is fine, and being wrong is fine.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform you would run it on
+      multiple: true
+      options:
+        - Microsoft Sentinel
+        - Defender XDR Advanced Hunting
+    validations:
+      required: true
+
+  - type: textarea
+    id: existing
+    attributes:
+      label: What you are doing today instead
+      description: |
+        Optional, and genuinely useful. If you already have KQL for this, paste
+        it — redacted. Half a working query is a better starting point than a
+        blank page.
+      render: kusto
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have removed all tenant data from this issue
+          required: true
