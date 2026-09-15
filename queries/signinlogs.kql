@@ -1,41 +1,5 @@
 //SigninLogs UserPrincipal query
 //
-// Sign-in investigation for a user, IP or device. Fill in any of the CHECK
-// values below and run; leave them blank and it returns everything.
-//
-// The filters use `contains`, so a partial value works ("jane" matches
-// jane.doe@contoso.com) and an empty string matches every row — which is why
-// blank means "no filter".
-//
-// Each `let` block below answers one question about the sign-in and is joined
-// onto every row: who the account belongs to, whether they are a new starter,
-// how many days the IP / device / location / user agent / app has been seen,
-// and which other accounts share the address.
-//
-// CHANGES SINCE v20251217 — everything else is as originally written:
-//   - Day counts use dcount(bin(TimeGenerated, 1d)) rather than
-//     dcount(datetime_part("day", TimeGenerated)). Identical results at
-//     TimeToCheck = 30d; the original silently caps at 31 and collides
-//     (3 Jan and 3 Feb are the same value) if TimeToCheck is ever raised.
-//   - make_set(Identity) in DistinctIDfromIP is capped at 100. A shared
-//     corporate egress address would otherwise make that one cell enormous.
-//   - UniqueEvents is count() not dcount(CorrelationId), which was always 1 by
-//     construction. It now means "events in this sign-in session", so it is no
-//     longer thrown away by project-away.
-//   - NewStarterCheck joins leftouter, not fullouter. fullouter emitted rows
-//     for new starters with no sign-in, which the UserPrincipalName filter
-//     further down discarded anyway.
-//   - project-reorder asks for Identity, not identity. Column names are
-//     case-sensitive, so the lowercase form matched nothing and the column was
-//     never promoted.
-//   - project-away drops DeviceShort1, not DeviceShort*. The wildcard removed
-//     DeviceShort as well, so the column project-reorder asks for never
-//     reached the output.
-//
-// STILL TO VERIFY: the two extract() regexes in NewStarterCheck were
-// transcribed from a screenshot. If the backslash escaping is wrong, JobTitle
-// and Identity return empty with no error.
-//
 let TimeToCheck = 30d;
 let UserIdentityCheck = "";
 let IPtoCheck = "";
