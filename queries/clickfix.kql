@@ -1,0 +1,113 @@
+//ClickFix UserPrincipal query
+//
+// CZYM JEST CLICKFIX
+// Ofiara trafia na spreparowaną stronę: fałszywą CAPTCHA, komunikat "napraw
+// błąd przeglądarki" albo prośbę o weryfikację, że nie jest robotem. Strona po
+// cichu wstawia polecenie do schowka i instruuje użytkownika, żeby otworzył
+// okno Uruchom (Win+R), wkleił je i nacisnął Enter. Nic nie zostaje pobrane
+// ani kliknięte, więc bramka pocztowa i filtr stron nie mają czego zatrzymać.
+// Kod uruchamia sam użytkownik, własnymi rękami.
+//
+// NA CZYM OPIERA SIĘ TO ZAPYTANIE
+// Okno Uruchom należy do explorer.exe, więc proces powstaje z explorer.exe
+// jako procesem nadrzędnym. Wklejony tekst trafia dodatkowo do rejestru, do
+// klucza Explorer\RunMRU. Te dwie poszlaki razem są praktycznie
+// rozstrzygające.
+//
+// KOLUMNA, KTÓRA PRZESĄDZA SPRAWĘ
+// RunMRUMatch — wpis z RunMRU, którego argumenty pokrywają się z wierszem
+// poleceń uruchomionego procesu. Jeżeli ta kolumna nie jest pusta, użytkownik
+// wkleił dokładnie to polecenie w okno Uruchom. To nie jest poszlaka, to
+// dowód. Wklej ją do zgłoszenia w całości.
+//
+// JAK CZYTAĆ WYNIK
+// ClickFixScore to suma poszlak, a nie werdykt. Punktacja:
+//   +3  RunMRUMatch niepuste — wklejenie potwierdzone w rejestrze
+//   +2  proces nadrzędny to explorer.exe (okno Uruchom albo dwuklik)
+//   +2  na urządzeniu w ogóle pojawiły się wpisy RunMRU w oknie czasowym
+//   +1  pobieranie i wykonanie w jednej linii (iex, iwr, curl, certutil)
+//   +1  flagi ukrycia okna lub obejścia zasad (hidden, bypass, -enc)
+//   +1  ślad po stronie-przynęcie (captcha, robot, verification, ✅)
+//   +1  długi ciąg Base64 w poleceniu
+//   +1  wiersz poleceń dłuższy niż 200 znaków
+//   +1  polecenie widziane na maksymalnie dwóch urządzeniach w firmie
+// Od 5 punktów w górę traktuj jako potwierdzone do czasu wykluczenia.
+// Sama wysoka punktacja bez RunMRUMatch to nadal tylko podejrzenie — może to
+// być administrator albo skrypt wdrożeniowy.
+//
+// CZEGO NIE UDOWODNI BRAK WYNIKÓW
+// Puste wyniki nie oznaczają, że nic się nie stało. RunMRU zapisuje się
+// dopiero po naciśnięciu Enter i tylko dla okna Uruchom — wklejenie do już
+// otwartego terminala PowerShell nie zostawi tam śladu. Sprawdź wtedy sam
+// ClickFixScore bez RunMRU.
+//
+// UWAGA O ŁĄCZENIU PO PID
+// RemoteUrls i DroppedFiles łączą się po DeviceId + ProcessId. PID jest
+// unikalny tylko na jednym urządzeniu i tylko między restartami, więc przy
+// oknie dłuższym niż kilka dni PID może się powtórzyć i podpiąć cudzy ruch.
+// Przy szerokim TimeToCheck weryfikuj te dwie kolumny osobno.
+//
+// WYDAJNOŚĆ
+// Przy pustych polach CHECK zapytanie czyta wszystkie zdarzenia procesów
+// z całej firmy i kilka razy łączy je ze sobą. Na dużym workspace zacznij od
+// TimeToCheck = 24h albo wpisz nazwę urządzenia.
+//
+let TimeToCheck = 14d;
+let DeviceCheck = "";
+let UserIdentityCheck = "";
+let CommandCheck = "";
+//
+// Programy, którymi ClickFix najczęściej startuje. Dopisz własne, jeśli
+// widzisz w środowisku inne żywiciele.
+let LolBins = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe","forfiles.exe","conhost.exe"]);
+// Pobierz i wykonaj w jednej linii — rdzeń niemal każdego wariantu.
+let DownloadWords = dynamic(["iex","invoke-expression","iwr","invoke-webrequest","invoke-restmethod","irm","downloadstring","downloadfile","webclient","curl","wget","bitstransfer","urlcache","frombase64string"]);
+// Ukrycie okna i obejście zasad wykonywania.
+let StealthWords = dynamic(["hidden","windowstyle","bypass","noprofile","nop","encodedcommand","enc","noninteractive","unrestricted"]);
+// Resztki tekstu ze strony-przynęty, które zostają w poleceniu.
+let LureWords = dynamic(["captcha","recaptcha","robot","verification","verify","cloudflare","human","ray","troubleshoot","fixit"]);
+//
+// KONTEKST: wpisy w oknie Uruchom na tym urządzeniu.
+let RunMRU = DeviceRegistryEvents | where TimeGenerated >= ago(TimeToCheck) | where RegistryKey has @"Explorer\RunMRU" | where isnotempty(RegistryValueData) | summarize RunMRUEntries = make_set(RegistryValueData, 50), RunMRUCount = count(), FirstRunMRU = min(TimeGenerated), LastRunMRU = max(TimeGenerated) by RmDeviceId = DeviceId;
+// KONTEKST: czym jest to urządzenie.
+let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, OSPlatform, DeviceType, PublicIP, OnboardingStatus, SensorHealthState;
+// KONTEKST: kim jest użytkownik. Wymaga UEBA albo Defender for Identity —
+// usuń ten blok i jego join, jeśli nie masz tabeli IdentityInfo.
+let Job = IdentityInfo | where AccountUPN contains UserIdentityCheck | where TimeGenerated >= ago(90d) | extend AccountUPN = tolower(AccountUPN) | summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles, "3.Manager", Manager) | project JobDetails, JobUserKey = AccountUPN;
+// KONTEKST: dokąd zadzwonił uruchomiony proces.
+let NetOut = DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(RemoteUrl) or isnotempty(RemoteIP) | summarize OutboundCount = count(), RemoteUrls = make_set(RemoteUrl, 15), RemoteIPs = make_set(RemoteIP, 15) by NoDeviceId = DeviceId, NoProcessId = InitiatingProcessId;
+// KONTEKST: co zapisał na dysku.
+let Drops = DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType in~ ("FileCreated","FileModified") | summarize DroppedFiles = make_set(FileName, 15), DropPaths = make_set(FolderPath, 10), DroppedHashes = make_set(SHA256, 10) by DfDeviceId = DeviceId, DfProcessId = InitiatingProcessId;
+// KONTEKST: rzadkość polecenia. ClickFix generuje unikalny ciąg dla ofiary,
+// narzędzie administracyjne widać na wielu maszynach.
+let CmdPrevalence = DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(ProcessCommandLine) | summarize DevicesRanThisCommand = dcount(DeviceId) by CpCmd = ProcessCommandLine;
+//
+DeviceProcessEvents
+| where TimeGenerated >= ago(TimeToCheck)
+| where FileName in~ (LolBins)
+// Wstępne zawężenie — bez niego zapytanie czyta całą tabelę procesów.
+| where InitiatingProcessFileName =~ "explorer.exe" or ProcessCommandLine has_any (DownloadWords) or ProcessCommandLine has_any (StealthWords) or ProcessCommandLine has_any (LureWords)
+| extend AccountKey = tolower(AccountUpn)
+| join kind=leftouter RunMRU on $left.DeviceId == $right.RmDeviceId | join kind=leftouter Machines on $left.DeviceId == $right.MiDeviceId | join kind=leftouter Job on $left.AccountKey == $right.JobUserKey | join kind=leftouter NetOut on $left.DeviceId == $right.NoDeviceId, $left.ProcessId == $right.NoProcessId | join kind=leftouter Drops on $left.DeviceId == $right.DfDeviceId, $left.ProcessId == $right.DfProcessId | join kind=leftouter CmdPrevalence on $left.ProcessCommandLine == $right.CpCmd
+// Porównanie wpisu z RunMRU z wierszem poleceń. Z wpisu ucinamy końcowe "\1",
+// które dokłada Windows, oraz pierwszy wyraz (nazwę programu) — w wierszu
+// poleceń stoi tam pełna ścieżka, więc porównujemy same argumenty.
+// mv-apply na pustej tablicy skasowałoby wiersz, stąd podstawienie dynamic([""]).
+| extend RunMRUList = iff(array_length(todynamic(RunMRUEntries)) > 0, todynamic(RunMRUEntries), dynamic([""]))
+| mv-apply E = RunMRUList to typeof(string) on ( extend Args = extract(@"^\S+\s+(.*)$", 1, trim_end(@"\\1", E)) | summarize RunMRUMatch = make_set_if(E, isnotempty(Args) and ProcessCommandLine contains Args, 5) )
+| extend ParentIsExplorer = InitiatingProcessFileName =~ "explorer.exe", HasDownload = ProcessCommandLine has_any (DownloadWords), HasStealth = ProcessCommandLine has_any (StealthWords), HasLure = ProcessCommandLine has_any (LureWords) or ProcessCommandLine contains "✅" or ProcessCommandLine contains "✔", HasBase64 = ProcessCommandLine matches regex @"[A-Za-z0-9+/]{40,}={0,2}", LongCommand = strlen(ProcessCommandLine) > 200
+| extend RunMRUCount = coalesce(RunMRUCount, 0), DevicesRanThisCommand = coalesce(DevicesRanThisCommand, 0), RunMRUHits = array_length(RunMRUMatch)
+// Suma poszlak. Rozpiska punktów jest w nagłówku pliku.
+| extend ClickFixScore = toint(RunMRUHits > 0) * 3 + toint(ParentIsExplorer) * 2 + toint(RunMRUCount > 0) * 2 + toint(HasDownload) + toint(HasStealth) + toint(HasLure) + toint(HasBase64) + toint(LongCommand) + toint(DevicesRanThisCommand > 0 and DevicesRanThisCommand <= 2)
+| where DeviceName contains DeviceCheck | where AccountUpn contains UserIdentityCheck or AccountName contains UserIdentityCheck | where ProcessCommandLine contains CommandCheck
+| project-rename EventTime = TimeGenerated
+| project-reorder EventTime, ClickFixScore, RunMRUHits, RunMRUMatch, DeviceName, AccountUpn, AccountName, JobDetails, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine, ParentIsExplorer, HasDownload, HasStealth, HasLure, HasBase64, LongCommand, DevicesRanThisCommand, RunMRUCount, RunMRUEntries, FirstRunMRU, LastRunMRU, OutboundCount, RemoteUrls, RemoteIPs, DroppedFiles, DropPaths, DroppedHashes, FolderPath, SHA256, ProcessIntegrityLevel, ProcessTokenElevation, OSPlatform, DeviceType, MachineGroup, PublicIP, OnboardingStatus, SensorHealthState, DeviceId, ProcessId
+| project-away SourceSystem, Type, TenantId, ReportId, AppGuardContainerId, CreatedProcessSessionId, InitiatingProcessSessionId, LogonId, InitiatingProcessLogonId, AccountSid, InitiatingProcessAccountSid, AccountObjectId, InitiatingProcessAccountObjectId, MD5, InitiatingProcessMD5, SHA1, InitiatingProcessSHA1, FileSize, InitiatingProcessFileSize, ProcessUniqueId, InitiatingProcessUniqueId, ProcessRemoteSessionDeviceName, ProcessRemoteSessionIP, InitiatingProcessRemoteSessionDeviceName, InitiatingProcessRemoteSessionIP, InitiatingProcessVersionInfoInternalFileName, InitiatingProcessVersionInfoOriginalFileName, InitiatingProcessVersionInfoProductVersion, ProcessVersionInfoInternalFileName, ProcessVersionInfoOriginalFileName, ProcessVersionInfoProductVersion, RunMRUList, AccountKey, RmDeviceId, MiDeviceId, JobUserKey, NoDeviceId, NoProcessId, DfDeviceId, DfProcessId, CpCmd
+| sort by ClickFixScore desc, EventTime desc
+//
+// WARIANTY — odkomentuj wybraną linię
+//| where RunMRUHits > 0                       // tylko potwierdzone wklejenia z okna Uruchom
+//| where ClickFixScore >= 5                   // tylko mocne trafienia
+//| where isnotempty(RemoteUrls)               // tylko te, które faktycznie coś pobrały
+//| where ParentIsExplorer and not(HasDownload) // wariant bez pobierania, np. czysty mshta
+//| summarize Urzadzenia = dcount(DeviceId), Uzytkownicy = dcount(AccountUpn), Polecenia = make_set(ProcessCommandLine, 20) by bin(EventTime, 1d)  // skala kampanii dzień po dniu

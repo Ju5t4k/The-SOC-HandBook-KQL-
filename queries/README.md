@@ -5,6 +5,12 @@
 | [`signinlogs.kql`](signinlogs.kql) | `SigninLogs` | Was this account used, and by whom. Job details, new-starter check, and day-counts for the IP, device, location, user agent and application |
 | [`auditlogs.kql`](auditlogs.kql) | `AuditLogs` | What did they change once they were in. Actor and target on every row, old and new values unpacked, and how routine the operation is for that actor |
 | [`officeactivity.kql`](officeactivity.kql) | `OfficeActivity` | What did they actually do to the data. Exchange, SharePoint, OneDrive and Teams activity with the source address scored against the account's sign-ins |
+| [`clickfix.kql`](clickfix.kql) | `DeviceProcessEvents` | One-shot ClickFix investigation. Scores a process against the Win+R fake-CAPTCHA pattern and proves the paste from the `RunMRU` registry key. **Comments in Polish** |
+
+The first three are identity and activity tables and run in sequence.
+`clickfix.kql` is different — it is threat-specific and endpoint-side, for when
+an alert already points at ClickFix and you need the whole picture in one run.
+Its comments are written in Polish.
 
 ## The order to run them in
 

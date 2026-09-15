@@ -6,6 +6,12 @@ Notable changes to this repository. Format follows
 ## [Unreleased]
 
 ### Added
+- `queries/clickfix.kql` — one-shot ClickFix investigation on
+  `DeviceProcessEvents`. Scores a process against the Win+R fake-CAPTCHA
+  pattern and correlates it with the `Explorer\RunMRU` registry key, which
+  proves what the user actually pasted into the Run dialog. Joins in device,
+  identity, outbound network and dropped-file context, plus estate-wide
+  command-line rarity. **Comments are in Polish.**
 - `queries/auditlogs.kql` — AuditLogs UserPrincipal query. Directory
   changes with the actor and the target on every row, `modifiedProperties`
   unpacked into old and new values, operation rarity per actor and tenant-wide,
