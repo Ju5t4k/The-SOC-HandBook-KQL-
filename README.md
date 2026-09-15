@@ -21,13 +21,6 @@ Queries are written for **Sentinel** unless the query says otherwise. On
 **Defender XDR Advanced Hunting** the time column on `Device*` tables is
 `Timestamp` rather than `TimeGenerated`, and lookback is capped at 30 days.
 
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Placeholders only — `<upn>`, `contoso.com`, `203.0.113.10`. No real tenant
-data, ever. [SECURITY.md](SECURITY.md) has the full list of what not to commit.
-
 ## Licence
 
 [MIT](LICENSE).
