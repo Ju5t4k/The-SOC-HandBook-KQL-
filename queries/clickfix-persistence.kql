@@ -1,0 +1,29 @@
+//ClickFix persistence query
+//
+// Co zostalo na stacji. To jest decyzja o przywroceniu maszyny do uzytku.
+let TimeToCheck = 14d;
+let DeviceCheck = "";
+let UserIdentityCheck = "";
+//
+let LolBins = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe"]);
+let SuspectPaths = dynamic([@"\appdata\",@"\temp\",@"\programdata\",@"\public\",@"\downloads\",@"\users\public\"]);
+//
+union isfuzzy=true
+    // Klucze autostartu w rejestrze.
+    (DeviceRegistryEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType in~ ("RegistryValueSet","RegistryKeyCreated") | where RegistryKey contains @"CurrentVersion\Run" or RegistryKey contains @"CurrentVersion\RunOnce" or RegistryKey contains "Winlogon" or RegistryKey contains "Image File Execution Options" or RegistryKey contains @"Policies\Explorer\Run" or RegistryKey contains @"CurrentVersion\Shell Extensions" | extend Method = "Rejestr-Autostart", Actor = InitiatingProcessAccountName, Payload = RegistryValueData, Location = strcat(RegistryKey, "\\", RegistryValueName), SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine),
+    // Zadania zaplanowane i uslugi zakladane z wiersza polecen.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ ("schtasks.exe","sc.exe","at.exe","reg.exe","wmic.exe") | where ProcessCommandLine has_any ("create","add","/create","/sc","config") | extend Method = "Zadanie-Usluga", Actor = AccountName, Payload = ProcessCommandLine, Location = FileName, SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine),
+    // Utrwalenie przez PowerShell: profil, WMI, zadania.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ ("powershell.exe","pwsh.exe") | where ProcessCommandLine has_any ("New-ScheduledTask","Register-ScheduledTask","New-Service","Set-Service","profile.ps1","Register-WmiEvent","New-CimInstance","__EventFilter") | extend Method = "PowerShell-Utrwalenie", Actor = AccountName, Payload = ProcessCommandLine, Location = FileName, SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine),
+    // Pliki w folderze Autostart.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where FolderPath contains @"\Start Menu\Programs\Startup" | extend Method = "Folder-Autostart", Actor = InitiatingProcessAccountName, Payload = strcat(FolderPath, " | SHA256=", SHA256, " | zrodlo=", FileOriginUrl), Location = FileName, SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine),
+    // Pliki wykonywalne zapisane przez LOLBin w katalogach zapisywalnych przez uzytkownika.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType in~ ("FileCreated","FileModified") | where InitiatingProcessFileName in~ (LolBins) | where FolderPath has_any (SuspectPaths) | where FileName endswith ".exe" or FileName endswith ".dll" or FileName endswith ".ps1" or FileName endswith ".bat" or FileName endswith ".vbs" or FileName endswith ".js" or FileName endswith ".hta" | extend Method = "Zapis-LOLBin", Actor = InitiatingProcessAccountName, Payload = strcat(FolderPath, " | SHA256=", SHA256, " | zrodlo=", FileOriginUrl), Location = FileName, SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine)
+| where DeviceName contains DeviceCheck
+| where Actor contains UserIdentityCheck
+| project-rename EventTime = TimeGenerated
+| project EventTime, Method, DeviceName, Actor, Location, Payload, SetBy, SetByCmd
+| sort by EventTime desc
+//
+//| where SetBy in~ (LolBins)          // tylko to, co zalozyl LOLBin, nie instalator
+//| summarize Metody = make_set(Method, 10), Pierwsze = min(EventTime) by DeviceName  // jedna linia na stacje

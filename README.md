@@ -9,8 +9,14 @@ KQL queries for SOC analysts working in Microsoft Sentinel and Defender XDR.
 
 ```
 queries/    the queries — see queries/README.md for the index
-docs/       background reading and reference
+docs/       playbooks and reference
 ```
+
+### Playbooks
+
+- [ClickFix — end-to-end investigation](docs/clickfix-playbook.md) — attack
+  timeline, seven investigation phases with the query for each, containment
+  order, and what an empty result does not prove.
 
 ## Using these
 
