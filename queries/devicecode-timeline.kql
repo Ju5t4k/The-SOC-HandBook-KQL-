@@ -1,0 +1,35 @@
+//DeviceCode timeline query
+//
+// Ustaw PivotTime na czas logowania device code (EventTime z devicecode.kql).
+let PivotTime = now();
+let BeforeWindow = 4h;
+let AfterWindow = 48h;
+let UserIdentityCheck = "";
+//
+let StartTime = PivotTime - BeforeWindow;
+let EndTime = PivotTime + AfterWindow;
+//
+union isfuzzy=true
+    // FAZA 1 — dostarczenie kodu. Mail albo Teams z prosba o wpisanie kodu.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where OfficeWorkload in~ ("Exchange","MicrosoftTeams") | where Operation has_any ("MailItemsAccessed","Send","MessageSent","ChatCreated","MemberAdded") | extend Phase = "1-Dostarczenie", Source = "OfficeActivity", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP)),
+    // FAZA 2 — wpisanie kodu. Logowanie wyglada wzorowo: prawdziwy uzytkownik,
+    // prawdziwe MFA, prawdziwy adres. Braku bledu nie traktuj jako dowodu.
+    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | extend Phase = "2-Wpisanie kodu", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("deviceCode ", ResultType, " ", ResultDescription, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | MFA=", AuthenticationRequirement, " | CA=", ConditionalAccessStatus)),
+    // FAZA 3 — pozostale logowania interaktywne uzytkownika w oknie.
+    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol !~ "deviceCode" | extend Phase = "3-Logowania", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("logowanie ", ResultType, " | ", AppDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | ", ClientAppUsed)),
+    // FAZA 4 — uzycie tokena. Tu widac napastnika: ta sama tozsamosc, inna siec.
+    (AADNonInteractiveUserSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "4-Uzycie tokena", Source = "NonInteractive", Actor = UserPrincipalName, Detail = strcat(SignInEventTypes, " ", ResultType, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(todynamic(LocationDetails).countryOrRegion), " | token=", IncomingTokenType)),
+    // FAZA 5 — jednostki uslug. Zgoda na aplikacje daje dostep bez uzytkownika.
+    (AADServicePrincipalSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "5-Jednostka uslugi", Source = "ServicePrincipal", Actor = ServicePrincipalName, Detail = strcat(ResultType, " | ", AppId, " -> ", ResourceDisplayName, " | ", IPAddress)),
+    // FAZA 6 — utrwalenie w katalogu. MFA, zgody, sekrety, role.
+    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "6-Katalog", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", tostring(InitiatedBy.user.ipAddress), " | cel=", tostring(TargetResources))),
+    // FAZA 7 — dzialania w chmurze. Reguly skrzynki, pobrania, udostepnienia.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation !has "MailItemsAccessed" | extend Phase = "7-Chmura", Source = "OfficeActivity", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP, " | ", MailboxOwnerUPN))
+| where Actor contains UserIdentityCheck
+| project-rename EventTime = TimeGenerated
+| project EventTime, Phase, Source, Actor, Detail
+| sort by EventTime asc
+//
+//| where Phase startswith "2-" or Phase startswith "4-"   // tylko wydanie i uzycie tokena
+//| where Phase startswith "6-"                            // tylko zmiany w katalogu
+//| summarize Zdarzenia = count(), Pierwsze = min(EventTime), Ostatnie = max(EventTime) by Phase

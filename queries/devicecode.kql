@@ -1,0 +1,43 @@
+//DeviceCode UserPrincipal query
+//
+let TimeToCheck = 14d;
+let BaselineToCheck = 90d;
+let UserIdentityCheck = "";
+let IPtoCheck = "";
+let AppCheck = "";
+//
+// Publiczne aplikacje klienckie najczesciej naduzywane w tym ataku.
+// Zweryfikuj liste wzgledem wlasnego najemcy i dopisz brakujace.
+let AbusedApps = dynamic(["29d9ed98-a469-4536-ade2-f981bc1d605e","d3590ed6-52b3-4102-aeff-aad2292ab01c","04b07795-8ddb-461a-bbee-02f9e1bf7b46","1950a258-227b-4e31-a9cf-717495945fc2","aebc6443-996d-45c2-90f0-388ff96faa56","9ba1a5c7-f17a-4de9-a1f1-6178c8d51223","872cd9fa-d31f-45e0-9eab-6e460a02d1f1"]);
+let HighValueResources = dynamic(["Microsoft Graph","Office 365 Exchange Online","Office 365 SharePoint Online","Windows Azure Service Management API","Azure Key Vault"]);
+//
+let Job = IdentityInfo | where AccountUPN contains UserIdentityCheck | where TimeGenerated >= ago(BaselineToCheck) | extend AccountUPN = tolower(AccountUPN) | summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles, "3.Manager", Manager) | project JobDetails, JobUserKey = AccountUPN;
+// Czy ten uzytkownik w ogole uzywa device code? Zwykle nie.
+let UserDcHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | summarize DaysDcSeenByUser = dcount(bin(TimeGenerated, 1d)) by DcUserKey = tolower(UserPrincipalName);
+// Jak rzadkie jest device code w calej firmie.
+let OrgDcHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | summarize UsersUsingDcInOrg = dcount(UserPrincipalName), DaysDcSeenInOrg = dcount(bin(TimeGenerated, 1d)) by OdResource = ResourceDisplayName;
+// Czy adres jest znany temu uzytkownikowi.
+let UserIpHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where ResultType == "0" | summarize DaysIpSeenByUser = dcount(bin(TimeGenerated, 1d)) by IpUserKey = tolower(UserPrincipalName), IpAddr = IPAddress;
+// Gdzie potem uzyto tokena. To jest kolumna, ktora przesadza sprawe.
+let TokenUse = AADNonInteractiveUserSignInLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | summarize TokenUseCount = count(), TokenIPs = make_set(IPAddress, 25), TokenASNs = make_set(AutonomousSystemNumber, 15), TokenApps = make_set(AppDisplayName, 10), TokenResources = make_set(ResourceDisplayName, 10), FirstTokenUse = min(TimeGenerated), LastTokenUse = max(TimeGenerated) by TuUserKey = tolower(UserPrincipalName);
+//
+SigninLogs
+| where TimeGenerated >= ago(TimeToCheck)
+| where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow"
+| extend UserKey = tolower(UserPrincipalName), Country = tostring(LocationDetails.countryOrRegion), City = tostring(LocationDetails.city), DeviceName = tostring(DeviceDetail.displayName), IsCompliant = tostring(DeviceDetail.isCompliant), IsManaged = tostring(DeviceDetail.isManaged)
+| join kind=leftouter Job on $left.UserKey == $right.JobUserKey | join kind=leftouter UserDcHistory on $left.UserKey == $right.DcUserKey | join kind=leftouter OrgDcHistory on $left.ResourceDisplayName == $right.OdResource | join kind=leftouter UserIpHistory on $left.UserKey == $right.IpUserKey, $left.IPAddress == $right.IpAddr | join kind=leftouter TokenUse on $left.UserKey == $right.TuUserKey
+| extend DaysDcSeenByUser = coalesce(DaysDcSeenByUser, 0), DaysIpSeenByUser = coalesce(DaysIpSeenByUser, 0), UsersUsingDcInOrg = coalesce(UsersUsingDcInOrg, 0)
+// Token wydany tutaj, uzywany z innej sieci. Porownujemy ASN i adres.
+| extend OtherASNsAfter = set_difference(coalesce(TokenASNs, dynamic([])), pack_array(AutonomousSystemNumber)), OtherIPsAfter = set_difference(coalesce(TokenIPs, dynamic([])), pack_array(IPAddress))
+| extend Succeeded = ResultType == "0", AbusedApp = AppId in~ (AbusedApps), FirstDcForUser = DaysDcSeenByUser <= 1, NewIpForUser = DaysIpSeenByUser <= 1, Unmanaged = IsManaged !~ "true" and IsCompliant !~ "true", HighValue = ResourceDisplayName in~ (HighValueResources), TokenMoved = array_length(OtherASNsAfter) > 0
+// Suma poszlak. Rozpiska jest w docs/devicecode-playbook.md.
+| extend DeviceCodeScore = toint(Succeeded) * 3 + toint(TokenMoved) * 3 + toint(FirstDcForUser) * 2 + toint(AbusedApp) + toint(NewIpForUser) + toint(Unmanaged) + toint(HighValue) + toint(UsersUsingDcInOrg <= 3)
+| where UserPrincipalName contains UserIdentityCheck | where IPAddress contains IPtoCheck | where AppDisplayName contains AppCheck
+| project-rename LogCreatedTime = TimeGenerated, EventTime = CreatedDateTime
+| project EventTime, LogCreatedTime, DeviceCodeScore, UserPrincipalName, JobDetails, ResultType, ResultDescription, AuthenticationProtocol, OriginalTransferMethod, AppDisplayName, AppId, AbusedApp, ResourceDisplayName, HighValue, IPAddress, AutonomousSystemNumber, Country, City, DaysIpSeenByUser, NewIpForUser, DaysDcSeenByUser, FirstDcForUser, UsersUsingDcInOrg, DeviceName, IsManaged, IsCompliant, Unmanaged, TokenMoved, OtherASNsAfter, OtherIPsAfter, TokenUseCount, TokenApps, TokenResources, FirstTokenUse, LastTokenUse, AuthenticationRequirement, ConditionalAccessStatus, RiskLevelDuringSignIn, RiskState, UserAgent, SessionId, UniqueTokenIdentifier, CorrelationId
+| sort by DeviceCodeScore desc, EventTime desc
+//
+//| where Succeeded and TokenMoved          // token wydany i uzyty z innej sieci
+//| where Succeeded and FirstDcForUser      // pierwsze device code tego uzytkownika
+//| where ResultType != "0"                 // proby nieudane, np. kod wygasl
+//| summarize Uzytkownicy = dcount(UserPrincipalName), Aplikacje = make_set(AppDisplayName, 10) by bin(EventTime, 1d)  // skala kampanii

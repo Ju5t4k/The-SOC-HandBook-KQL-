@@ -1,0 +1,25 @@
+//DeviceCode scope query
+//
+// Kto jeszcze. Wypelnij jeden ze wskaznikow z devicecode.kql i uruchom.
+let TimeToCheck = 30d;
+let IPCheck = "";
+let ASNCheck = "";
+let AppCheck = "";
+let UserAgentCheck = "";
+//
+let Job = IdentityInfo | where TimeGenerated >= ago(90d) | extend AccountUPN = tolower(AccountUPN) | summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles) | project JobDetails, JobUserKey = AccountUPN;
+//
+union isfuzzy=true
+    // Inne logowania device code z tego samego adresu, sieci lub aplikacji.
+    (SigninLogs | where TimeGenerated >= ago(TimeToCheck) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | extend Hit = "DeviceCode", Actor = UserPrincipalName, Asn = AutonomousSystemNumber, Agent = UserAgent, Evidence = strcat(ResultType, " | ", AppDisplayName, " -> ", ResourceDisplayName)),
+    // Uzycie tokena z tej samej infrastruktury u innych uzytkownikow.
+    (AADNonInteractiveUserSignInLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | extend Hit = "UzycieTokena", Actor = UserPrincipalName, Asn = AutonomousSystemNumber, Agent = UserAgent, Evidence = strcat(SignInEventTypes, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | token=", IncomingTokenType))
+| where (isnotempty(IPCheck) and IPAddress contains IPCheck) or (isnotempty(ASNCheck) and Asn contains ASNCheck) or (isnotempty(AppCheck) and AppDisplayName contains AppCheck) or (isnotempty(UserAgentCheck) and Agent contains UserAgentCheck)
+| extend UserKey = tolower(Actor)
+| join kind=leftouter Job on $left.UserKey == $right.JobUserKey
+| project-rename EventTime = TimeGenerated
+| project EventTime, Hit, Actor, JobDetails, IPAddress, Asn, AppDisplayName, ResourceDisplayName, Agent, Evidence, ConditionalAccessStatus, RiskLevelDuringSignIn
+| sort by EventTime asc
+//
+//| summarize Uzytkownicy = dcount(Actor), Trafienia = make_set(Hit, 4), Pierwsze = min(EventTime), Ostatnie = max(EventTime) by bin(EventTime, 1d)  // skala kampanii
+//| summarize Trafienia = make_set(Hit, 4), Aplikacje = make_set(AppDisplayName, 10), Pierwsze = min(EventTime) by Actor  // jedna linia na uzytkownika

@@ -9,14 +9,23 @@
 | [`clickfix-timeline.kql`](clickfix-timeline.kql) | `Device*`, `SigninLogs`, `OfficeActivity` | The ClickFix incident as one timeline, tagged by phase: lure, paste, execution, download, disk, persistence, defence, identity, cloud |
 | [`clickfix-persistence.kql`](clickfix-persistence.kql) | `Device*` | What was left behind — run keys, scheduled tasks, services, startup folder, LOLBin drops. The reimage decision |
 | [`clickfix-scope.kql`](clickfix-scope.kql) | `Device*` | Blast radius. Give it a URL, hash, command or IP and it finds every other device and user hit the same way |
+| [`devicecode.kql`](devicecode.kql) | `SigninLogs` | Device code phishing triage. Finds `AuthenticationProtocol == "deviceCode"` sign-ins and scores them, including whether the issued token was later used from a different ASN |
+| [`devicecode-timeline.kql`](devicecode-timeline.kql) | `SigninLogs`, non-interactive, service principal, `AuditLogs`, `OfficeActivity` | The device code incident as one timeline: delivery, code entry, token use, service principals, directory changes, cloud activity |
+| [`devicecode-persistence.kql`](devicecode-persistence.kql) | `AuditLogs`, `OfficeActivity`, service principal | What survives a password reset — MFA methods, app consent, service principal credentials, mailbox rules |
+| [`devicecode-scope.kql`](devicecode-scope.kql) | `SigninLogs`, non-interactive | Blast radius by IP, ASN, app or user agent. ASN is the one that finds the campaign |
 
 The first three are identity and activity tables and run in sequence.
 
-The four `clickfix-*` files are threat-specific and endpoint-side. They are
-meant to be worked in order and are documented end to end in
-[`../docs/clickfix-playbook.md`](../docs/clickfix-playbook.md), which carries
-the attack timeline, the phase-by-phase investigation, the containment order
-and the ticket checklist. Their comments are written in Polish.
+The `clickfix-*` and `devicecode-*` files are threat-specific and meant to be
+worked in order. Each set has a playbook carrying the attack timeline, the
+phase-by-phase investigation, the containment order and the ticket checklist:
+
+- [`../docs/clickfix-playbook.md`](../docs/clickfix-playbook.md) — endpoint
+  side, Win+R fake-CAPTCHA execution
+- [`../docs/devicecode-playbook.md`](../docs/devicecode-playbook.md) — identity
+  side, OAuth device code phishing
+
+Comments in both sets are written in Polish.
 
 ## The order to run them in
 

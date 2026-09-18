@@ -1,0 +1,26 @@
+//DeviceCode persistence query
+//
+// Co trzyma napastnika w srodku po kradziezy tokena. Reset hasla tego nie usuwa.
+let TimeToCheck = 14d;
+let UserIdentityCheck = "";
+//
+// Operacje katalogowe, ktore przedluzaja dostep albo omijaja MFA.
+let PersistOps = dynamic(["User registered security info","User changed default security info","Admin registered security info","User deleted security info","Add member to role","Add eligible member to role","Consent to application","Add delegated permission grant","Add app role assignment to service principal","Add service principal","Add service principal credentials","Add application","Update application","Add owner to application","Add owner to service principal","Update conditional access policy","Delete conditional access policy","Disable Strong Authentication","Reset user password","Update user"]);
+// Operacje pocztowe, ktore przezywaja reset hasla i uniewaznienie sesji.
+let MailOps = dynamic(["New-InboxRule","Set-InboxRule","Enable-InboxRule","UpdateInboxRules","Set-Mailbox","Add-MailboxPermission","Add-RecipientPermission","Set-MailboxFolderPermission","Add-MailboxFolderPermission","New-TransportRule","Set-TransportRule"]);
+//
+union isfuzzy=true
+    // Zmiany w katalogu.
+    (AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (PersistOps) | mv-expand TargetResources | extend Method = "Katalog", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), ActorIP = tostring(InitiatedBy.user.ipAddress), Target = coalesce(tostring(TargetResources.userPrincipalName), tostring(TargetResources.displayName)), What = OperationName, Outcome = Result, Evidence = tostring(TargetResources.modifiedProperties)),
+    // Reguly i uprawnienia skrzynki.
+    (OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where Operation in~ (MailOps) | extend Method = "Skrzynka", Actor = UserId, ActorIP = ClientIP, Target = MailboxOwnerUPN, What = Operation, Outcome = ResultStatus, Evidence = Parameters),
+    // Aplikacje logujace sie jako jednostka uslugi po nadaniu zgody.
+    (AADServicePrincipalSignInLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | extend Method = "Jednostka uslugi", Actor = ServicePrincipalName, ActorIP = IPAddress, Target = ResourceDisplayName, What = "Logowanie aplikacji", Outcome = ResultType, Evidence = AppId)
+| where Actor contains UserIdentityCheck or Target contains UserIdentityCheck
+| project-rename EventTime = TimeGenerated
+| project EventTime, Method, What, Outcome, Actor, ActorIP, Target, Evidence
+| sort by EventTime desc
+//
+//| where Method == "Skrzynka"                    // tylko reguly poczty
+//| where What has_any ("security info","Consent") // tylko MFA i zgody na aplikacje
+//| summarize Zmiany = count(), Rodzaje = make_set(What, 15) by Actor, Method
