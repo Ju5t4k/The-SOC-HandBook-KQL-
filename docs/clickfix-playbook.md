@@ -12,8 +12,6 @@ Four queries support this playbook. Each phase below names the one to run.
 | [`clickfix-persistence.kql`](../queries/clickfix-persistence.kql) | 6 — what is still there |
 | [`clickfix-scope.kql`](../queries/clickfix-scope.kql) | 7 — who else |
 
-Comments inside the queries are in Polish.
-
 ---
 
 ## What you are looking at
@@ -94,15 +92,15 @@ Run **`clickfix-timeline.kql`**. Set `PivotTime` to the value from Phase 0,
 It returns one table, oldest first, tagged by phase:
 
 ```
-1-Przyneta     the lure page the command was copied from
-2-Wklejenie    the RunMRU write — the paste itself
-3-Wykonanie    what explorer.exe spawned
-4-Pobranie     what that process fetched, from where
-5-Zapis        what was written to disk, and its FileOriginUrl
-6-Utrwalenie   persistence written in the window
-7-Obrona       what AV or ASR did, if anything
-8-Tozsamosc    sign-ins for the user in the window
-9-Chmura       M365 activity in the window
+1-Lure         the lure page the command was copied from
+2-Paste        the RunMRU write — the paste itself
+3-Execution    what explorer.exe spawned
+4-Download     what that process fetched, from where
+5-Disk         what was written to disk, and its FileOriginUrl
+6-Persistence  persistence written in the window
+7-Defence      what AV or ASR did, if anything
+8-Identity     sign-ins for the user in the window
+9-Cloud        M365 activity in the window
 ```
 
 Read it top to bottom. It is the incident narrative, in order, and it is what
@@ -113,8 +111,8 @@ while before they act on the lure.
 
 ### Phase 2 — The lure
 
-From the `1-Przyneta` rows, take the host the user was on immediately before
-the `2-Wklejenie` row.
+From the `1-Lure` rows, take the host the user was on immediately before the
+`2-Paste` row.
 
 Decide whether it was **malvertising** (ad network in the referrer chain),
 **SEO poisoning** (search engine → fake download page), a **compromised
@@ -127,7 +125,7 @@ tell you, because at this point they know something went wrong.
 
 ### Phase 3 — The payload
 
-From `4-Pobranie` and `5-Zapis`:
+From `4-Download` and `5-Disk`:
 
 - Every distinct external host contacted by a non-browser process
 - Every file written, with its `SHA256` and its `FileOriginUrl`
@@ -141,7 +139,7 @@ rather than as harmless.
 
 ### Phase 4 — Defensive reaction
 
-The `7-Obrona` rows tell you whether anything stopped it.
+The `7-Defence` rows tell you whether anything stopped it.
 
 **Blocked is not the same as prevented.** A detection at the third stage still
 means stages one and two ran to completion. Read what was blocked and when,
@@ -151,7 +149,7 @@ Empty here is common and means nothing either way.
 
 ### Phase 5 — Identity impact · the phase people skip
 
-Rows tagged `8-Tozsamosc` and `9-Chmura`.
+Rows tagged `8-Identity` and `9-Cloud`.
 
 ClickFix usually delivers an infostealer, and infostealers take **session
 cookies and refresh tokens**. A stolen token is used from the attacker's own
@@ -180,11 +178,11 @@ Run **`clickfix-persistence.kql`** with `DeviceCheck` set.
 It returns five kinds of foothold:
 
 ```
-Rejestr-Autostart      Run, RunOnce, Winlogon, IFEO
-Zadanie-Usluga         schtasks, sc, at, reg, wmic from the command line
-PowerShell-Utrwalenie  scheduled tasks, services, profile.ps1, WMI subscriptions
-Folder-Autostart       files dropped into the Startup folder
-Zapis-LOLBin           executables written by a LOLBin into user-writable paths
+Registry-Autorun        Run, RunOnce, Winlogon, IFEO
+Task-Service            schtasks, sc, at, reg, wmic from the command line
+PowerShell-Persistence  scheduled tasks, services, profile.ps1, WMI subscriptions
+Startup-Folder          files dropped into the Startup folder
+LOLBin-Write            executables written by a LOLBin into user-writable paths
 ```
 
 Anything here written by a LOLBin in the incident window is attacker

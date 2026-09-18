@@ -12,8 +12,6 @@ Four queries support this playbook. Each phase below names the one to run.
 | [`devicecode-persistence.kql`](../queries/devicecode-persistence.kql) | 5 — what is keeping them in |
 | [`devicecode-scope.kql`](../queries/devicecode-scope.kql) | 6 — who else |
 
-Comments inside the queries are in Polish.
-
 ---
 
 ## What you are looking at
@@ -110,16 +108,16 @@ Run **`devicecode-timeline.kql`**. Set `PivotTime` to the value from Phase 0 and
 One table, oldest first, tagged by phase:
 
 ```
-1-Dostarczenie      mail and Teams around the phish
-2-Wpisanie kodu     the device code sign-in itself
-3-Logowania         the user's other interactive sign-ins in the window
-4-Uzycie tokena     non-interactive sign-ins — where the token actually went
-5-Jednostka uslugi  service principal sign-ins
-6-Katalog           directory changes
-7-Chmura            M365 activity
+1-Delivery           mail and Teams around the phish
+2-Code entry         the device code sign-in itself
+3-Sign-ins           the user's other interactive sign-ins in the window
+4-Token use          non-interactive sign-ins — where the token actually went
+5-Service principal  service principal sign-ins
+6-Directory          directory changes
+7-Cloud              M365 activity
 ```
 
-Put the `2-Wpisanie kodu` row next to the `4-Uzycie tokena` rows and compare
+Put the `2-Code entry` row next to the `4-Token use` rows and compare
 **IP and ASN**. Same identity, different network, minutes apart, is the whole
 case. Screenshot those two lines for the ticket.
 
@@ -128,7 +126,7 @@ redeemed by anyone else — but check Phase 5 before concluding that.
 
 ### Phase 2 — How the code was delivered
 
-From `1-Dostarczenie`, find how the victim received the code. Device code
+From `1-Delivery`, find how the victim received the code. Device code
 phishing usually arrives by **Teams message** or a **phone call**, not email,
 precisely because it needs a live conversation to talk someone through typing a
 code.
@@ -142,7 +140,7 @@ already have.
 
 ### Phase 3 — What the token reached
 
-From `4-Uzycie tokena` and `7-Chmura`:
+From `4-Token use` and `7-Cloud`:
 
 - Every distinct `ResourceDisplayName` the token was used against
 - Every distinct IP and ASN
@@ -154,7 +152,7 @@ Graph is, in practice, the user's whole mailbox and their whole OneDrive.
 
 ### Phase 4 — Was it only one token
 
-Check `3-Logowania` for other sign-ins in the window, and `5-Jednostka uslugi`
+Check `3-Sign-ins` for other sign-ins in the window, and `5-Service principal`
 for applications signing in on their own.
 
 An attacker with one token often uses it to consent to an application, because
@@ -169,10 +167,10 @@ Run **`devicecode-persistence.kql`** with `UserIdentityCheck` set.
 Three kinds of foothold, all of which outlive a password reset:
 
 ```
-Katalog            MFA methods registered, roles added, app consent,
+Directory          MFA methods registered, roles added, app consent,
                    service principal credentials, CA policy changes
-Skrzynka           inbox rules, forwarding, mailbox delegation, transport rules
-Jednostka uslugi   applications signing in under granted consent
+Mailbox            inbox rules, forwarding, mailbox delegation, transport rules
+Service principal  applications signing in under granted consent
 ```
 
 Anything here timestamped after the device code sign-in is attacker work until
@@ -183,6 +181,13 @@ after the phish is not the victim.
 
 Run **`devicecode-scope.kql`** with whichever indicator you have: `IPCheck`,
 `ASNCheck`, `AppCheck` or `UserAgentCheck`.
+
+Results are tagged by how they matched:
+
+```
+DeviceCode   another device code sign-in from the same address, network or app
+TokenUse     a token used from the same infrastructure against another user
+```
 
 **`ASNCheck` is the most useful one.** Attackers change IP address easily and
 hosting provider rarely. An ASN that appears against three unrelated users in a
@@ -216,8 +221,8 @@ In this order. The order is the point.
 
 ## For the ticket
 
-- Pivot time, and the `2-Wpisanie kodu` row from the timeline
-- The `4-Uzycie tokena` rows showing the different IP and ASN — the proof
+- Pivot time, and the `2-Code entry` row from the timeline
+- The `4-Token use` rows showing the different IP and ASN — the proof
 - Every resource the token reached
 - How the code was delivered, and by whom
 - Persistence found, with timestamps relative to the pivot

@@ -1,6 +1,6 @@
 //ClickFix scope query
 //
-// Kto jeszcze. Wypelnij jeden ze wskaznikow z clickfix.kql i uruchom.
+// Who else. Fill in one indicator from clickfix.kql and run.
 let TimeToCheck = 30d;
 let UrlCheck = "";
 let HashCheck = "";
@@ -8,24 +8,24 @@ let CommandCheck = "";
 let IPCheck = "";
 //
 let LolBins = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe"]);
-// Kontekst: kim sa wlasciciele trafionych stacji.
+// Context: what the affected devices are.
 let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, OSPlatform, DeviceType, MachineGroup, OnboardingStatus, SensorHealthState;
 //
 union isfuzzy=true
-    // Ta sama komenda wklejona na innej stacji.
-    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ (LolBins) | where isnotempty(CommandCheck) and ProcessCommandLine contains CommandCheck | extend Hit = "Komenda", Evidence = ProcessCommandLine, Actor = AccountName),
-    // Ten sam wpis w oknie Uruchom.
+    // The same command pasted on another device.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ (LolBins) | where isnotempty(CommandCheck) and ProcessCommandLine contains CommandCheck | extend Hit = "Command", Evidence = ProcessCommandLine, Actor = AccountName),
+    // The same entry in the Run dialog.
     (DeviceRegistryEvents | where TimeGenerated >= ago(TimeToCheck) | where RegistryKey has @"Explorer\RunMRU" | where isnotempty(CommandCheck) and RegistryValueData contains CommandCheck | extend Hit = "RunMRU", Evidence = RegistryValueData, Actor = InitiatingProcessAccountName),
-    // Ruch do tego samego hosta.
-    (DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(UrlCheck) and RemoteUrl contains UrlCheck) or (isnotempty(IPCheck) and RemoteIP contains IPCheck) | extend Hit = "Siec", Evidence = strcat(InitiatingProcessFileName, " -> ", iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), ":", tostring(RemotePort)), Actor = InitiatingProcessAccountName),
-    // Ten sam plik na dysku.
-    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(HashCheck) and SHA256 =~ HashCheck) or (isnotempty(UrlCheck) and FileOriginUrl contains UrlCheck) | extend Hit = "Plik", Evidence = strcat(FolderPath, " | SHA256=", SHA256, " | zrodlo=", FileOriginUrl), Actor = InitiatingProcessAccountName),
-    // Ten sam plik uruchomiony.
-    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(HashCheck) and SHA256 =~ HashCheck | extend Hit = "Uruchomienie", Evidence = ProcessCommandLine, Actor = AccountName)
+    // Traffic to the same host.
+    (DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(UrlCheck) and RemoteUrl contains UrlCheck) or (isnotempty(IPCheck) and RemoteIP contains IPCheck) | extend Hit = "Network", Evidence = strcat(InitiatingProcessFileName, " -> ", iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), ":", tostring(RemotePort)), Actor = InitiatingProcessAccountName),
+    // The same file on disk.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(HashCheck) and SHA256 =~ HashCheck) or (isnotempty(UrlCheck) and FileOriginUrl contains UrlCheck) | extend Hit = "File", Evidence = strcat(FolderPath, " | SHA256=", SHA256, " | origin=", FileOriginUrl), Actor = InitiatingProcessAccountName),
+    // The same file executed.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(HashCheck) and SHA256 =~ HashCheck | extend Hit = "Execution", Evidence = ProcessCommandLine, Actor = AccountName)
 | join kind=leftouter Machines on $left.DeviceId == $right.MiDeviceId
 | project-rename EventTime = TimeGenerated
 | project EventTime, Hit, DeviceName, Actor, Evidence, OSPlatform, DeviceType, MachineGroup, OnboardingStatus, SensorHealthState, DeviceId
 | sort by EventTime asc
 //
-//| summarize Stacje = dcount(DeviceId), Uzytkownicy = dcount(Actor), Pierwsze = min(EventTime), Ostatnie = max(EventTime), Trafienia = make_set(Hit, 6) by bin(EventTime, 1d)  // skala kampanii dzien po dniu
-//| summarize Trafienia = make_set(Hit, 6), Pierwsze = min(EventTime) by DeviceName, Actor  // jedna linia na stacje
+//| summarize Devices = dcount(DeviceId), Users = dcount(Actor), First = min(EventTime), Last = max(EventTime), Hits = make_set(Hit, 6) by bin(EventTime, 1d)  // campaign scale day by day
+//| summarize Hits = make_set(Hit, 6), First = min(EventTime) by DeviceName, Actor  // one line per device

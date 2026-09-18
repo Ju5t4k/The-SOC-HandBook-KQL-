@@ -1,6 +1,6 @@
 //ClickFix timeline query
 //
-// Ustaw PivotTime na moment wklejenia (kolumna EventTime z clickfix.kql).
+// Set PivotTime to the moment of the paste (EventTime from clickfix.kql).
 let PivotTime = now();
 let BeforeWindow = 2h;
 let AfterWindow = 24h;
@@ -14,32 +14,32 @@ let LolBins = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscrip
 let DefenceActions = dynamic(["AntivirusDetection","AntivirusReport","TamperingAttempt","ExploitGuardNetworkProtectionBlocked","SecurityControlConfigurationChange","AntivirusConfigurationChange","AsrLsassCredentialTheftBlocked","AntivirusScanCancelled"]);
 //
 union isfuzzy=true
-    // FAZA 1 — przynęta. Strona, z której ofiara skopiowała polecenie.
-    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType == "BrowserLaunchedToOpenUrl" | where isnotempty(RemoteUrl) | extend Phase = "1-Przyneta", Source = "DeviceEvents", Actor = AccountName, Detail = strcat("przegladarka otworzyla: ", RemoteUrl, " | ", InitiatingProcessFileName)),
-    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where InitiatingProcessFileName in~ (Browsers) | where isnotempty(RemoteUrl) | extend Phase = "1-Przyneta", Source = "DeviceNetworkEvents", Actor = InitiatingProcessAccountName, Detail = strcat("ruch przegladarki: ", RemoteUrl, " (", RemoteIP, ":", tostring(RemotePort), ")")),
-    // FAZA 2 — wklejenie. RunMRU to dowod, ze uzyto okna Uruchom.
-    (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where RegistryKey has @"Explorer\RunMRU" | where isnotempty(RegistryValueData) | extend Phase = "2-Wklejenie", Source = "DeviceRegistryEvents", Actor = InitiatingProcessAccountName, Detail = strcat("RunMRU [", RegistryValueName, "] = ", RegistryValueData)),
-    // FAZA 3 — wykonanie.
-    (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where FileName in~ (LolBins) or InitiatingProcessFileName =~ "explorer.exe" | extend Phase = "3-Wykonanie", Source = "DeviceProcessEvents", Actor = AccountName, Detail = strcat(InitiatingProcessFileName, " -> ", FileName, " | ", ProcessCommandLine)),
-    // FAZA 4 — pobranie ladunku. Ruch spoza przegladarki.
-    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where InitiatingProcessFileName !in~ (Browsers) | where RemoteIPType == "Public" | extend Phase = "4-Pobranie", Source = "DeviceNetworkEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " -> ", iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), ":", tostring(RemotePort))),
-    // FAZA 5 — zapis na dysk. FileOriginUrl mowi skad plik pochodzi.
-    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | extend Phase = "5-Zapis", Source = "DeviceFileEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " zapisal ", FolderPath, " | SHA256=", SHA256, " | zrodlo=", FileOriginUrl)),
-    // FAZA 6 — utrwalenie.
-    (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where RegistryKey contains @"CurrentVersion\Run" or RegistryKey contains @"CurrentVersion\RunOnce" or RegistryKey contains "Winlogon" or RegistryKey contains "Image File Execution Options" or RegistryKey contains @"Policies\Explorer\Run" | extend Phase = "6-Utrwalenie", Source = "DeviceRegistryEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " ustawil ", RegistryKey, "\\", RegistryValueName, " = ", RegistryValueData)),
-    // FAZA 7 — reakcja obrony. Puste nie znaczy czysto.
-    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType in~ (DefenceActions) | extend Phase = "7-Obrona", Source = "DeviceEvents", Actor = AccountName, Detail = strcat(ActionType, " | ", FileName, " | ", FolderPath)),
-    // FAZA 8 — tozsamosc. Kradziez tokena widac tu, nie na stacji.
-    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "8-Tozsamosc", Source = "SigninLogs", DeviceName = tostring(DeviceDetail.displayName), Actor = UserPrincipalName, Detail = strcat("logowanie ", ResultType, " ", ResultDescription, " | ", IPAddress, " | ", tostring(LocationDetails.countryOrRegion), " | ", AppDisplayName)),
-    // FAZA 9 — chmura. Reguly skrzynki, pobrania, udostepnienia.
-    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "9-Chmura", Source = "OfficeActivity", DeviceName = "", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP))
-// Zdarzenia chmurowe nie maja nazwy stacji — DeviceCheck nie moze ich wyciac.
+    // PHASE 1 — the lure. The page the command was copied from.
+    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType == "BrowserLaunchedToOpenUrl" | where isnotempty(RemoteUrl) | extend Phase = "1-Lure", Source = "DeviceEvents", Actor = AccountName, Detail = strcat("browser opened: ", RemoteUrl, " | ", InitiatingProcessFileName)),
+    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where InitiatingProcessFileName in~ (Browsers) | where isnotempty(RemoteUrl) | extend Phase = "1-Lure", Source = "DeviceNetworkEvents", Actor = InitiatingProcessAccountName, Detail = strcat("browser traffic: ", RemoteUrl, " (", RemoteIP, ":", tostring(RemotePort), ")")),
+    // PHASE 2 — the paste. RunMRU is proof the Run dialog was used.
+    (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where RegistryKey has @"Explorer\RunMRU" | where isnotempty(RegistryValueData) | extend Phase = "2-Paste", Source = "DeviceRegistryEvents", Actor = InitiatingProcessAccountName, Detail = strcat("RunMRU [", RegistryValueName, "] = ", RegistryValueData)),
+    // PHASE 3 — execution.
+    (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where FileName in~ (LolBins) or InitiatingProcessFileName =~ "explorer.exe" | extend Phase = "3-Execution", Source = "DeviceProcessEvents", Actor = AccountName, Detail = strcat(InitiatingProcessFileName, " -> ", FileName, " | ", ProcessCommandLine)),
+    // PHASE 4 — payload fetch. Traffic from something other than a browser.
+    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where InitiatingProcessFileName !in~ (Browsers) | where RemoteIPType == "Public" | extend Phase = "4-Download", Source = "DeviceNetworkEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " -> ", iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), ":", tostring(RemotePort))),
+    // PHASE 5 — written to disk. FileOriginUrl says where the file came from.
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | extend Phase = "5-Disk", Source = "DeviceFileEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " wrote ", FolderPath, " | SHA256=", SHA256, " | origin=", FileOriginUrl)),
+    // PHASE 6 — persistence.
+    (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where RegistryKey contains @"CurrentVersion\Run" or RegistryKey contains @"CurrentVersion\RunOnce" or RegistryKey contains "Winlogon" or RegistryKey contains "Image File Execution Options" or RegistryKey contains @"Policies\Explorer\Run" | extend Phase = "6-Persistence", Source = "DeviceRegistryEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " set ", RegistryKey, "\\", RegistryValueName, " = ", RegistryValueData)),
+    // PHASE 7 — defensive reaction. Empty does not mean clean.
+    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType in~ (DefenceActions) | extend Phase = "7-Defence", Source = "DeviceEvents", Actor = AccountName, Detail = strcat(ActionType, " | ", FileName, " | ", FolderPath)),
+    // PHASE 8 — identity. Token theft shows here, not on the endpoint.
+    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "8-Identity", Source = "SigninLogs", DeviceName = tostring(DeviceDetail.displayName), Actor = UserPrincipalName, Detail = strcat("sign-in ", ResultType, " ", ResultDescription, " | ", IPAddress, " | ", tostring(LocationDetails.countryOrRegion), " | ", AppDisplayName)),
+    // PHASE 9 — cloud. Mailbox rules, downloads, sharing.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "9-Cloud", Source = "OfficeActivity", DeviceName = "", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP))
+// Cloud events carry no device name — DeviceCheck must not cut them out.
 | where isempty(DeviceName) or DeviceName contains DeviceCheck
 | where Actor contains UserIdentityCheck
 | project-rename EventTime = TimeGenerated
 | project EventTime, Phase, Source, DeviceName, Actor, Detail
 | sort by EventTime asc
 //
-//| where Phase startswith "1-" or Phase startswith "2-"   // tylko przyneta i wklejenie
-//| where Phase !startswith "8-" and Phase !startswith "9-" // tylko stacja robocza
-//| summarize Zdarzenia = count(), Pierwsze = min(EventTime), Ostatnie = max(EventTime) by Phase  // ile czego w kazdej fazie
+//| where Phase startswith "1-" or Phase startswith "2-"   // lure and paste only
+//| where Phase !startswith "8-" and Phase !startswith "9-" // endpoint only
+//| summarize Events = count(), First = min(EventTime), Last = max(EventTime) by Phase  // how much of what in each phase

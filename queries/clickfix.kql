@@ -6,7 +6,7 @@ let UserIdentityCheck = "";
 let CommandCheck = "";
 //
 let LolBins = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe","forfiles.exe","conhost.exe"]);
-// Pobierz i wykonaj w jednej linii — rdzeń niemal każdego wariantu.
+// Download and execute in one line — the core of almost every variant.
 let DownloadWords = dynamic(["iex","invoke-expression","iwr","invoke-webrequest","invoke-restmethod","irm","downloadstring","downloadfile","webclient","curl","wget","bitstransfer","urlcache","frombase64string"]);
 let StealthWords = dynamic(["hidden","windowstyle","bypass","noprofile","nop","encodedcommand","enc","noninteractive","unrestricted"]);
 let LureWords = dynamic(["captcha","recaptcha","robot","verification","verify","cloudflare","human","ray","troubleshoot","fixit"]);
@@ -35,8 +35,8 @@ DeviceProcessEvents
 | project-away SourceSystem, Type, TenantId, ReportId, AppGuardContainerId, CreatedProcessSessionId, InitiatingProcessSessionId, LogonId, InitiatingProcessLogonId, AccountSid, InitiatingProcessAccountSid, AccountObjectId, InitiatingProcessAccountObjectId, MD5, InitiatingProcessMD5, SHA1, InitiatingProcessSHA1, FileSize, InitiatingProcessFileSize, ProcessUniqueId, InitiatingProcessUniqueId, ProcessRemoteSessionDeviceName, ProcessRemoteSessionIP, InitiatingProcessRemoteSessionDeviceName, InitiatingProcessRemoteSessionIP, InitiatingProcessVersionInfoInternalFileName, InitiatingProcessVersionInfoOriginalFileName, InitiatingProcessVersionInfoProductVersion, ProcessVersionInfoInternalFileName, ProcessVersionInfoOriginalFileName, ProcessVersionInfoProductVersion, RunMRUList, AccountKey, RmDeviceId, MiDeviceId, JobUserKey, NoDeviceId, NoProcessId, DfDeviceId, DfProcessId, CpCmd
 | sort by ClickFixScore desc, EventTime desc
 //
-//| where RunMRUHits > 0                       // tylko potwierdzone wklejenia z okna Uruchom
-//| where ClickFixScore >= 5                   // tylko mocne trafienia
-//| where isnotempty(RemoteUrls)               // tylko te, które faktycznie coś pobrały
-//| where ParentIsExplorer and not(HasDownload) // wariant bez pobierania, np. czysty mshta
-//| summarize Urzadzenia = dcount(DeviceId), Uzytkownicy = dcount(AccountUpn), Polecenia = make_set(ProcessCommandLine, 20) by bin(EventTime, 1d)  // skala kampanii dzień po dniu
+//| where RunMRUHits > 0                       // confirmed pastes from the Run dialog only
+//| where ClickFixScore >= 5                   // strong hits only
+//| where isnotempty(RemoteUrls)               // only the ones that actually fetched something
+//| where ParentIsExplorer and not(HasDownload) // no-download variant, e.g. plain mshta
+//| summarize Devices = dcount(DeviceId), Users = dcount(AccountUpn), Commands = make_set(ProcessCommandLine, 20) by bin(EventTime, 1d)  // campaign scale day by day

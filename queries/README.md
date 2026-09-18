@@ -25,7 +25,6 @@ phase-by-phase investigation, the containment order and the ticket checklist:
 - [`../docs/devicecode-playbook.md`](../docs/devicecode-playbook.md) — identity
   side, OAuth device code phishing
 
-Comments in both sets are written in Polish.
 
 ## The order to run them in
 
