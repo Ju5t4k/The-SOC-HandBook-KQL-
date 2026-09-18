@@ -6,12 +6,17 @@ let UserIdentityCheck = "";
 //
 // Directory operations that extend access or bypass MFA.
 let PersistOps = dynamic(["User registered security info","User changed default security info","Admin registered security info","User deleted security info","Add member to role","Add eligible member to role","Consent to application","Add delegated permission grant","Add app role assignment to service principal","Add service principal","Add service principal credentials","Add application","Update application","Add owner to application","Add owner to service principal","Update conditional access policy","Delete conditional access policy","Disable Strong Authentication","Reset user password","Update user"]);
+// Device registration and passwordless credentials. A device joined after the
+// theft yields a Primary Refresh Token, which survives session revocation.
+let DeviceOps = dynamic(["Add device","Update device","Add registered owner to device","Add registered users to device","Register device","Pre-create device","Add Windows Hello for Business credential","Add passwordless phone sign-in credential","Add Passkey (device-bound)","Add platform credential","Device no longer compliant","Device no longer managed"]);
 // Mail operations that survive a password reset and session revocation.
 let MailOps = dynamic(["New-InboxRule","Set-InboxRule","Enable-InboxRule","UpdateInboxRules","Set-Mailbox","Add-MailboxPermission","Add-RecipientPermission","Set-MailboxFolderPermission","Add-MailboxFolderPermission","New-TransportRule","Set-TransportRule"]);
 //
 union isfuzzy=true
     // Directory changes.
     (AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (PersistOps) | mv-expand TargetResources | extend Method = "Directory", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), ActorIP = tostring(InitiatedBy.user.ipAddress), Target = coalesce(tostring(TargetResources.userPrincipalName), tostring(TargetResources.displayName)), What = OperationName, Outcome = Result, Evidence = tostring(TargetResources.modifiedProperties)),
+    // Devices registered and passwordless credentials added.
+    (AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (DeviceOps) | mv-expand TargetResources | extend Method = "Device", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), ActorIP = tostring(InitiatedBy.user.ipAddress), Target = coalesce(tostring(TargetResources.displayName), tostring(TargetResources.userPrincipalName)), What = OperationName, Outcome = Result, Evidence = strcat(LoggedByService, " | ", tostring(TargetResources.modifiedProperties))),
     // Mailbox rules and permissions.
     (OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where Operation in~ (MailOps) | extend Method = "Mailbox", Actor = UserId, ActorIP = ClientIP, Target = MailboxOwnerUPN, What = Operation, Outcome = ResultStatus, Evidence = Parameters),
     // Applications signing in as a service principal after consent was granted.
@@ -21,6 +26,7 @@ union isfuzzy=true
 | project EventTime, Method, What, Outcome, Actor, ActorIP, Target, Evidence
 | sort by EventTime desc
 //
+//| where Method == "Device"                      // device registration only
 //| where Method == "Mailbox"                    // mail rules only
 //| where What has_any ("security info","Consent") // MFA methods and app consent only
 //| summarize Changes = count(), Kinds = make_set(What, 15) by Actor, Method

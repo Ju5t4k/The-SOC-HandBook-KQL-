@@ -9,6 +9,9 @@ let AppCheck = "";
 // Public client applications most often abused in this attack.
 // Verify this list against your own tenant and add any that are missing.
 let AbusedApps = dynamic(["29d9ed98-a469-4536-ade2-f981bc1d605e","d3590ed6-52b3-4102-aeff-aad2292ab01c","04b07795-8ddb-461a-bbee-02f9e1bf7b46","1950a258-227b-4e31-a9cf-717495945fc2","aebc6443-996d-45c2-90f0-388ff96faa56","9ba1a5c7-f17a-4de9-a1f1-6178c8d51223","872cd9fa-d31f-45e0-9eab-6e460a02d1f1"]);
+// Device registration is the standard follow-on: a joined device yields a
+// Primary Refresh Token, which outlives revoking the stolen one.
+let DeviceOps = dynamic(["Add device","Update device","Add registered owner to device","Add registered users to device","Register device","Pre-create device","Add Windows Hello for Business credential","Add passwordless phone sign-in credential","Add Passkey (device-bound)","Add platform credential","Device no longer compliant","Device no longer managed"]);
 let HighValueResources = dynamic(["Microsoft Graph","Office 365 Exchange Online","Office 365 SharePoint Online","Windows Azure Service Management API","Azure Key Vault"]);
 //
 let Job = IdentityInfo | where AccountUPN contains UserIdentityCheck | where TimeGenerated >= ago(BaselineToCheck) | extend AccountUPN = tolower(AccountUPN) | summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles, "3.Manager", Manager) | project JobDetails, JobUserKey = AccountUPN;
@@ -20,24 +23,27 @@ let OrgDcHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | wh
 let UserIpHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where ResultType == "0" | summarize DaysIpSeenByUser = dcount(bin(TimeGenerated, 1d)) by IpUserKey = tolower(UserPrincipalName), IpAddr = IPAddress;
 // Where the token was used afterwards. This is the column that decides it.
 let TokenUse = AADNonInteractiveUserSignInLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | summarize TokenUseCount = count(), TokenIPs = make_set(IPAddress, 25), TokenASNs = make_set(AutonomousSystemNumber, 15), TokenApps = make_set(AppDisplayName, 10), TokenResources = make_set(ResourceDisplayName, 10), FirstTokenUse = min(TimeGenerated), LastTokenUse = max(TimeGenerated) by TuUserKey = tolower(UserPrincipalName);
+// Did this account register a device in the window?
+let DeviceRegs = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (DeviceOps) | mv-expand TargetResources | extend DrUserKey = tolower(coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))) | where isnotempty(DrUserKey) | summarize DevicesAdded = count(), DevicesAddedNames = make_set(tostring(TargetResources.displayName), 10), DeviceOpsUsed = make_set(OperationName, 10), FirstDeviceAdded = min(TimeGenerated) by DrUserKey;
 //
 SigninLogs
 | where TimeGenerated >= ago(TimeToCheck)
 | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow"
 | extend UserKey = tolower(UserPrincipalName), Country = tostring(LocationDetails.countryOrRegion), City = tostring(LocationDetails.city), DeviceName = tostring(DeviceDetail.displayName), IsCompliant = tostring(DeviceDetail.isCompliant), IsManaged = tostring(DeviceDetail.isManaged)
-| join kind=leftouter Job on $left.UserKey == $right.JobUserKey | join kind=leftouter UserDcHistory on $left.UserKey == $right.DcUserKey | join kind=leftouter OrgDcHistory on $left.ResourceDisplayName == $right.OdResource | join kind=leftouter UserIpHistory on $left.UserKey == $right.IpUserKey, $left.IPAddress == $right.IpAddr | join kind=leftouter TokenUse on $left.UserKey == $right.TuUserKey
-| extend DaysDcSeenByUser = coalesce(DaysDcSeenByUser, 0), DaysIpSeenByUser = coalesce(DaysIpSeenByUser, 0), UsersUsingDcInOrg = coalesce(UsersUsingDcInOrg, 0)
+| join kind=leftouter Job on $left.UserKey == $right.JobUserKey | join kind=leftouter UserDcHistory on $left.UserKey == $right.DcUserKey | join kind=leftouter OrgDcHistory on $left.ResourceDisplayName == $right.OdResource | join kind=leftouter UserIpHistory on $left.UserKey == $right.IpUserKey, $left.IPAddress == $right.IpAddr | join kind=leftouter TokenUse on $left.UserKey == $right.TuUserKey | join kind=leftouter DeviceRegs on $left.UserKey == $right.DrUserKey
+| extend DaysDcSeenByUser = coalesce(DaysDcSeenByUser, 0), DaysIpSeenByUser = coalesce(DaysIpSeenByUser, 0), UsersUsingDcInOrg = coalesce(UsersUsingDcInOrg, 0), DevicesAdded = coalesce(DevicesAdded, 0)
 // Token issued here, used from another network. Compare ASN and address.
 | extend OtherASNsAfter = set_difference(coalesce(TokenASNs, dynamic([])), pack_array(AutonomousSystemNumber)), OtherIPsAfter = set_difference(coalesce(TokenIPs, dynamic([])), pack_array(IPAddress))
-| extend Succeeded = ResultType == "0", AbusedApp = AppId in~ (AbusedApps), FirstDcForUser = DaysDcSeenByUser <= 1, NewIpForUser = DaysIpSeenByUser <= 1, Unmanaged = IsManaged !~ "true" and IsCompliant !~ "true", HighValue = ResourceDisplayName in~ (HighValueResources), TokenMoved = array_length(OtherASNsAfter) > 0
+| extend Succeeded = ResultType == "0", AbusedApp = AppId in~ (AbusedApps), FirstDcForUser = DaysDcSeenByUser <= 1, NewIpForUser = DaysIpSeenByUser <= 1, Unmanaged = IsManaged !~ "true" and IsCompliant !~ "true", HighValue = ResourceDisplayName in~ (HighValueResources), TokenMoved = array_length(OtherASNsAfter) > 0, DeviceAdded = DevicesAdded > 0
 // Sum of indicators. The weighting is in docs/devicecode-playbook.md.
-| extend DeviceCodeScore = toint(Succeeded) * 3 + toint(TokenMoved) * 3 + toint(FirstDcForUser) * 2 + toint(AbusedApp) + toint(NewIpForUser) + toint(Unmanaged) + toint(HighValue) + toint(UsersUsingDcInOrg <= 3)
+| extend DeviceCodeScore = toint(Succeeded) * 3 + toint(TokenMoved) * 3 + toint(DeviceAdded) * 2 + toint(FirstDcForUser) * 2 + toint(AbusedApp) + toint(NewIpForUser) + toint(Unmanaged) + toint(HighValue) + toint(UsersUsingDcInOrg <= 3)
 | where UserPrincipalName contains UserIdentityCheck | where IPAddress contains IPtoCheck | where AppDisplayName contains AppCheck
 | project-rename LogCreatedTime = TimeGenerated, EventTime = CreatedDateTime
-| project EventTime, LogCreatedTime, DeviceCodeScore, UserPrincipalName, JobDetails, ResultType, ResultDescription, AuthenticationProtocol, OriginalTransferMethod, AppDisplayName, AppId, AbusedApp, ResourceDisplayName, HighValue, IPAddress, AutonomousSystemNumber, Country, City, DaysIpSeenByUser, NewIpForUser, DaysDcSeenByUser, FirstDcForUser, UsersUsingDcInOrg, DeviceName, IsManaged, IsCompliant, Unmanaged, TokenMoved, OtherASNsAfter, OtherIPsAfter, TokenUseCount, TokenApps, TokenResources, FirstTokenUse, LastTokenUse, AuthenticationRequirement, ConditionalAccessStatus, RiskLevelDuringSignIn, RiskState, UserAgent, SessionId, UniqueTokenIdentifier, CorrelationId
+| project EventTime, LogCreatedTime, DeviceCodeScore, UserPrincipalName, JobDetails, ResultType, ResultDescription, AuthenticationProtocol, OriginalTransferMethod, AppDisplayName, AppId, AbusedApp, ResourceDisplayName, HighValue, IPAddress, AutonomousSystemNumber, Country, City, DaysIpSeenByUser, NewIpForUser, DaysDcSeenByUser, FirstDcForUser, UsersUsingDcInOrg, DeviceName, IsManaged, IsCompliant, Unmanaged, TokenMoved, OtherASNsAfter, OtherIPsAfter, DeviceAdded, DevicesAdded, DevicesAddedNames, DeviceOpsUsed, FirstDeviceAdded, TokenUseCount, TokenApps, TokenResources, FirstTokenUse, LastTokenUse, AuthenticationRequirement, ConditionalAccessStatus, RiskLevelDuringSignIn, RiskState, UserAgent, SessionId, UniqueTokenIdentifier, CorrelationId
 | sort by DeviceCodeScore desc, EventTime desc
 //
 //| where Succeeded and TokenMoved          // token issued and then used from another network
+//| where DeviceAdded                      // a device was registered by this account
 //| where Succeeded and FirstDcForUser      // this user's first ever device code sign-in
 //| where ResultType != "0"                 // failed attempts, e.g. the code expired
 //| summarize Users = dcount(UserPrincipalName), Apps = make_set(AppDisplayName, 10) by bin(EventTime, 1d)  // campaign scale

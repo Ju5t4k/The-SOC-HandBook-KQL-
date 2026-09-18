@@ -55,6 +55,7 @@ sign-in sit close together in time.
 | T+1–15m | Attacker's poll returns access + refresh tokens | Nothing distinct — the token issue is part of the same sign-in | — |
 | T+minutes | Refresh token used from attacker infrastructure | **Non-interactive sign-ins, different IP and ASN, same user** | `AADNonInteractiveUserSignInLogs` |
 | T+minutes–hrs | Mail read, files enumerated, directory queried | Resource access under the stolen token | `OfficeActivity`, non-interactive |
+| T+hours | **Device registered** to obtain a Primary Refresh Token | `Add device`, `Register device`, Windows Hello / passkey added | `AuditLogs` |
 | T+hours | MFA method registered, app consent granted, secrets added | Directory changes by the victim's account | `AuditLogs` |
 | T+hours | Mailbox rules, forwarding, onward phishing | Rule creation | `OfficeActivity` |
 | T+days | Consented application signs in on its own | Service principal sign-ins | `AADServicePrincipalSignInLogs` |
@@ -72,23 +73,25 @@ password, the attacker keeps working.
 Run **`devicecode.kql`**. Leave the `CHECK` fields blank to sweep, or set
 `UserIdentityCheck` if you already have a name.
 
-Read `TokenMoved` and `OtherASNsAfter` first.
+Read `TokenMoved`, `DeviceAdded` and `OtherASNsAfter` first.
 
-| `TokenMoved` | `DeviceCodeScore` | Verdict |
+| Signal | `DeviceCodeScore` | Verdict |
 |---|---|---|
-| true | any | **Treat as compromise.** A token issued here is being used from another network. Go to Phase 1 now. |
-| false | ≥ 7 | **Probable.** Successful device code, first time for this user, unmanaged device. Continue. |
-| false | 4–6 | Suspicious. Check whether the user has a legitimate reason — CLI, headless server, shared device. |
-| false | ≤ 3 | Likely legitimate. Note and close. |
+| `TokenMoved` true | any | **Treat as compromise.** A token issued here is being used from another network. Go to Phase 1 now. |
+| `DeviceAdded` true | any | **Treat as compromise.** A device was registered by this account in the window. Go to Phase 1, then Phase 4. |
+| neither | ≥ 7 | **Probable.** Successful device code, first time for this user, unmanaged device. Continue. |
+| neither | 4–6 | Suspicious. Check whether the user has a legitimate reason — CLI, headless server, shared device. |
+| neither | ≤ 3 | Likely legitimate. Note and close. |
 
 Record the `EventTime` of the highest-scoring row. That is your **pivot time**.
 
-The score is built from eight indicators:
+The score is built from nine indicators:
 
 | Weight | Indicator |
 |---|---|
 | +3 | The sign-in succeeded |
 | +3 | `TokenMoved` — token later used from a different ASN |
+| +2 | `DeviceAdded` — this account registered a device in the window |
 | +2 | `FirstDcForUser` — this user has not used device code before |
 | +1 | `AbusedApp` — a commonly abused public client |
 | +1 | `NewIpForUser` — address unfamiliar for this account |
@@ -96,9 +99,11 @@ The score is built from eight indicators:
 | +1 | `HighValue` — resource is Graph, Exchange, SharePoint, ARM or Key Vault |
 | +1 | Device code is rare tenant-wide (≤ 3 users) |
 
-> `TokenMoved` compares ASNs across the whole `TimeToCheck` window, not strictly
-> after the sign-in. It is a strong pointer, not a timed correlation. Phase 1 is
-> what establishes the actual order of events.
+> `TokenMoved` and `DeviceAdded` both look across the whole `TimeToCheck`
+> window rather than strictly after the sign-in, so they are strong pointers
+> rather than timed correlations. `DevicesAddedNames`, `DeviceOpsUsed` and
+> `FirstDeviceAdded` give you the detail. Phase 1 is what establishes the actual
+> order of events.
 
 ### Phase 1 — Reconstruct · 15 minutes
 
@@ -113,8 +118,9 @@ One table, oldest first, tagged by phase:
 3-Sign-ins           the user's other interactive sign-ins in the window
 4-Token use          non-interactive sign-ins — where the token actually went
 5-Service principal  service principal sign-ins
-6-Directory          directory changes
-7-Cloud              M365 activity
+6-Device             devices registered, passwordless credentials added
+7-Directory          every other directory change
+8-Cloud              M365 activity
 ```
 
 Put the `2-Code entry` row next to the `4-Token use` rows and compare
@@ -140,7 +146,7 @@ already have.
 
 ### Phase 3 — What the token reached
 
-From `4-Token use` and `7-Cloud`:
+From `4-Token use` and `8-Cloud`:
 
 - Every distinct `ResourceDisplayName` the token was used against
 - Every distinct IP and ASN
@@ -152,26 +158,45 @@ Graph is, in practice, the user's whole mailbox and their whole OneDrive.
 
 ### Phase 4 — Was it only one token
 
-Check `3-Sign-ins` for other sign-ins in the window, and `5-Service principal`
-for applications signing in on their own.
+Check `3-Sign-ins` for other sign-ins in the window, `5-Service principal` for
+applications signing in on their own, and `6-Device` for anything registered.
 
 An attacker with one token often uses it to consent to an application, because
 an application's access **survives token revocation**. If a service principal
 sign-in appears after the device code event and you do not recognise the app,
 that is now the primary problem.
 
+The same is true of devices, and this is the one people miss. A stolen token is
+enough to **register a device** in Entra ID, and a registered device is issued
+its own Primary Refresh Token. That PRT is a separate credential: it survives
+revoking the stolen token, it survives the password reset, and it can satisfy a
+Conditional Access policy that requires a compliant or joined device — so the
+control you were relying on now works *for* the attacker.
+
+Anything in `6-Device` timestamped after the pivot is the attacker's, unless the
+user can account for it. Watch for `Add Windows Hello for Business credential`,
+`Add passwordless phone sign-in credential` and `Add Passkey (device-bound)`
+as well as the device object itself — those are durable, MFA-satisfying
+credentials bound to hardware you do not control.
+
 ### Phase 5 — What is keeping them in · the revocation decision
 
 Run **`devicecode-persistence.kql`** with `UserIdentityCheck` set.
 
-Three kinds of foothold, all of which outlive a password reset:
+Four kinds of foothold, all of which outlive a password reset:
 
 ```
+Device             devices registered or updated, Windows Hello, passkeys,
+                   passwordless phone sign-in, platform credentials
 Directory          MFA methods registered, roles added, app consent,
                    service principal credentials, CA policy changes
 Mailbox            inbox rules, forwarding, mailbox delegation, transport rules
 Service principal  applications signing in under granted consent
 ```
+
+`Device` and `Service principal` are the two that also outlive **session
+revocation**, so treat them as the ones that decide whether the incident is
+actually closed.
 
 Anything here timestamped after the device code sign-in is attacker work until
 proven otherwise. An MFA method registered by the victim's own account hours
@@ -206,13 +231,16 @@ In this order. The order is the point.
    password reset alone leaves every issued refresh token working.
 2. **Reset the password** afterwards, so a re-issued token needs the new one.
 3. **Review MFA methods** and remove anything registered since the pivot time.
-4. **Review app consents and service principal credentials.** Application access
+4. **Remove any device registered since the pivot time**, and revoke its PRT by
+   disabling or deleting the device object. A device registered by the attacker
+   holds a credential that step 1 does not touch.
+5. **Review app consents and service principal credentials.** Application access
    survives step 1 — this is the step that actually ends it.
-5. **Check mailbox rules** before closing. A forwarding rule survives everything
+6. **Check mailbox rules** before closing. A forwarding rule survives everything
    above.
-6. **Block the attacker ASN** in Conditional Access if the tenant's policy
+7. **Block the attacker ASN** in Conditional Access if the tenant's policy
    allows named-location blocking.
-7. **Restrict the device code flow.** A Conditional Access policy targeting
+8. **Restrict the device code flow.** A Conditional Access policy targeting
    `Authentication flows → Device code flow` blocks this outright for users who
    have no need of it, which is nearly all of them. This is the fix, not the
    workaround.
@@ -225,6 +253,7 @@ In this order. The order is the point.
 - The `4-Token use` rows showing the different IP and ASN — the proof
 - Every resource the token reached
 - How the code was delivered, and by whom
+- Any device registered since the pivot, and whether it was removed
 - Persistence found, with timestamps relative to the pivot
 - Every user and ASN from `devicecode-scope.kql`
 - **When sessions were revoked** — not just that the password was reset
@@ -256,6 +285,8 @@ the first time ever, from an unmanaged device, is the one to look at.
   the same provider as the victim will not show a divergence.
 - **Revoking sessions does not remove consented applications.** Those have their
   own credentials and their own sign-ins.
+- **Revoking sessions does not remove a registered device.** Its Primary Refresh
+  Token is a separate credential and keeps working.
 - **A blocked or failed device code sign-in is still worth reading.** It means
   someone was asked for a code. The next attempt may have succeeded.
 

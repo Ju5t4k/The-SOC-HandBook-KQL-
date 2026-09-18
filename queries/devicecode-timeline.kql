@@ -8,6 +8,7 @@ let UserIdentityCheck = "";
 //
 let StartTime = PivotTime - BeforeWindow;
 let EndTime = PivotTime + AfterWindow;
+let DeviceOps = dynamic(["Add device","Update device","Add registered owner to device","Add registered users to device","Register device","Pre-create device","Add Windows Hello for Business credential","Add passwordless phone sign-in credential","Add Passkey (device-bound)","Add platform credential","Device no longer compliant","Device no longer managed"]);
 //
 union isfuzzy=true
     // PHASE 1 — code delivery. Mail or Teams asking the user to enter a code.
@@ -21,15 +22,19 @@ union isfuzzy=true
     (AADNonInteractiveUserSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "4-Token use", Source = "NonInteractive", Actor = UserPrincipalName, Detail = strcat(SignInEventTypes, " ", ResultType, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(todynamic(LocationDetails).countryOrRegion), " | token=", IncomingTokenType)),
     // PHASE 5 — service principals. App consent grants access without the user.
     (AADServicePrincipalSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "5-Service principal", Source = "ServicePrincipal", Actor = ServicePrincipalName, Detail = strcat(ResultType, " | ", AppId, " -> ", ResourceDisplayName, " | ", IPAddress)),
-    // PHASE 6 — directory persistence. MFA methods, consent, secrets, roles.
-    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "6-Directory", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", tostring(InitiatedBy.user.ipAddress), " | cel=", tostring(TargetResources))),
-    // PHASE 7 — cloud activity. Mailbox rules, downloads, sharing.
-    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation !has "MailItemsAccessed" | extend Phase = "7-Cloud", Source = "OfficeActivity", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP, " | ", MailboxOwnerUPN))
+    // PHASE 6 — device registration. A joined device yields a Primary Refresh
+    // Token, which outlives revoking the stolen one. Easy to miss in the noise.
+    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where OperationName has_any (DeviceOps) | extend Phase = "6-Device", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", LoggedByService, " | ", tostring(InitiatedBy.user.ipAddress), " | target=", tostring(TargetResources))),
+    // PHASE 7 — directory persistence. MFA methods, consent, secrets, roles.
+    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where not(OperationName has_any (DeviceOps)) | extend Phase = "7-Directory", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", tostring(InitiatedBy.user.ipAddress), " | cel=", tostring(TargetResources))),
+    // PHASE 8 — cloud activity. Mailbox rules, downloads, sharing.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation !has "MailItemsAccessed" | extend Phase = "8-Cloud", Source = "OfficeActivity", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP, " | ", MailboxOwnerUPN))
 | where Actor contains UserIdentityCheck
 | project-rename EventTime = TimeGenerated
 | project EventTime, Phase, Source, Actor, Detail
 | sort by EventTime asc
 //
 //| where Phase startswith "2-" or Phase startswith "4-"   // token issue and token use only
-//| where Phase startswith "6-"                            // directory changes only
+//| where Phase startswith "6-"                            // device registration only
+//| where Phase startswith "7-"                            // directory changes only
 //| summarize Events = count(), First = min(EventTime), Last = max(EventTime) by Phase
