@@ -1,0 +1,38 @@
+//BEC timeline query
+//
+// Set PivotTime to the mailbox change or the suspect sign-in (EventTime from bec.kql).
+let PivotTime = now();
+let BeforeWindow = 24h;
+let AfterWindow = 7d;
+let UserIdentityCheck = "";
+//
+let StartTime = PivotTime - BeforeWindow;
+let EndTime = PivotTime + AfterWindow;
+let BecOps = dynamic(["New-InboxRule","Set-InboxRule","Enable-InboxRule","UpdateInboxRules","Set-Mailbox","Add-MailboxPermission","Add-RecipientPermission","Set-MailboxFolderPermission","Add-MailboxFolderPermission","New-TransportRule","Set-TransportRule"]);
+let ReconOps = dynamic(["MailItemsAccessed","SearchQueryInitiatedExchange","MessageBind","Send","SendAs","SendOnBehalf"]);
+//
+union isfuzzy=true
+    // PHASE 1 — access. How they got in, and from where.
+    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "1-Access", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("sign-in ", ResultType, " ", ResultDescription, " | ", AppDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | ", ClientAppUsed)),
+    (AADNonInteractiveUserSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "1-Access", Source = "NonInteractive", Actor = UserPrincipalName, Detail = strcat(SignInEventTypes, " ", ResultType, " | ", AppDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | token=", IncomingTokenType)),
+    // PHASE 2 — reconnaissance. Reading and searching the mailbox is how the
+    // attacker finds the invoice worth intercepting.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation in~ (ReconOps) | extend Phase = "2-Recon", Source = "OfficeActivity", Actor = UserId, Detail = strcat(Operation, " | ", ResultStatus, " | ", ClientIP, " | ", ClientInfoString, " | mailbox=", MailboxOwnerUPN, " | ", Folder)),
+    // PHASE 3 — mailbox change. The rule, the forward, the delegation.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation in~ (BecOps) | extend Phase = "3-Mailbox change", Source = "OfficeActivity", Actor = UserId, Detail = strcat(Operation, " | ", ResultStatus, " | ", ClientIP, " | mailbox=", MailboxOwnerUPN, " | ", Parameters)),
+    // PHASE 4 — outbound. The fraud itself, and onward phishing.
+    (EmailEvents | where TimeGenerated between (StartTime .. EndTime) | where EmailDirection in~ ("Outbound","Intra-org") | extend Phase = "4-Outbound", Source = "EmailEvents", Actor = SenderFromAddress, Detail = strcat("to ", RecipientEmailAddress, " | ", Subject, " | ", DeliveryAction, "/", DeliveryLocation, " | firstContact=", tostring(IsFirstContact), " | attachments=", tostring(AttachmentCount), " | urls=", tostring(UrlCount), " | ", NetworkMessageId)),
+    // PHASE 5 — inbound. The thread being hijacked, and the replies coming back.
+    (EmailEvents | where TimeGenerated between (StartTime .. EndTime) | where EmailDirection == "Inbound" | extend Phase = "5-Inbound", Source = "EmailEvents", Actor = RecipientEmailAddress, Detail = strcat("from ", SenderFromAddress, " | ", Subject, " | ", DeliveryAction, "/", DeliveryLocation, " | threats=", ThreatTypes, " | ", NetworkMessageId)),
+    // PHASE 6 — directory. MFA, consent and roles that extend the access.
+    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "6-Directory", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", tostring(InitiatedBy.user.ipAddress), " | target=", tostring(TargetResources))),
+    // PHASE 7 — files. Invoices and bank details often live in SharePoint too.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where OfficeWorkload in~ ("SharePoint","OneDrive") | extend Phase = "7-Files", Source = "OfficeActivity", Actor = UserId, Detail = strcat(Operation, " | ", SourceFileName, " | ", Site_Url, " | ", ClientIP))
+| where Actor contains UserIdentityCheck
+| project-rename EventTime = TimeGenerated
+| project EventTime, Phase, Source, Actor, Detail
+| sort by EventTime asc
+//
+//| where Phase startswith "3-" or Phase startswith "4-"   // the change and the fraud
+//| where Phase startswith "2-"                            // what they read
+//| summarize Events = count(), First = min(EventTime), Last = max(EventTime) by Phase

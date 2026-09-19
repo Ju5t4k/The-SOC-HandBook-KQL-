@@ -1,0 +1,55 @@
+//BEC UserPrincipal query
+//
+let TimeToCheck = 14d;
+let BaselineToCheck = 90d;
+let UserIdentityCheck = "";
+let MailboxCheck = "";
+let IPtoCheck = "";
+//
+// Mailbox operations a business email compromise needs in order to work.
+let BecOps = dynamic(["New-InboxRule","Set-InboxRule","Enable-InboxRule","UpdateInboxRules","Set-Mailbox","Set-MailboxJunkEmailConfiguration","Add-MailboxPermission","Add-RecipientPermission","Set-MailboxFolderPermission","Add-MailboxFolderPermission","New-TransportRule","Set-TransportRule"]);
+// Folders a rule uses to put replies somewhere the real owner will not look.
+let HidingFolders = dynamic(["Deleted Items","RSS Feeds","RSS Subscriptions","Conversation History","Junk Email","Archive","Notes","Sync Issues"]);
+// Words that turn a mail rule into a fraud rule. Tune to your own business.
+let FinanceWords = dynamic(["invoice","payment","remittance","wire","transfer","bank","iban","swift","sort code","account details","payroll","ach","purchase order","statement","receipt","overdue","refund","vendor","supplier"]);
+// Replace with your own accepted domains. The external-forward test is only
+// as good as this list.
+let InternalDomains = dynamic(["contoso.com","contoso.onmicrosoft.com"]);
+//
+let Job = IdentityInfo | where AccountUPN contains UserIdentityCheck | where TimeGenerated >= ago(BaselineToCheck) | extend AccountUPN = tolower(AccountUPN) | summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles, "3.Manager", Manager) | project JobDetails, JobUserKey = AccountUPN;
+// Did the account actually sign in from the address the change came from?
+let SignInFromIP = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where ResultType == "0" | summarize DaysSignedInFromIP = dcount(bin(TimeGenerated, 1d)) by SiUserKey = tolower(UserPrincipalName), SiIP = IPAddress;
+// Normal outbound volume for this mailbox, to compare against the window.
+let OutboundBaseline = EmailEvents | where TimeGenerated >= ago(BaselineToCheck) | where EmailDirection == "Outbound" | summarize DailyOut = count() by ObUserKey = tolower(SenderFromAddress), Day = bin(TimeGenerated, 1d) | summarize NormalOutPerDay = avg(DailyOut) by ObUserKey;
+let OutboundWindow = EmailEvents | where TimeGenerated >= ago(TimeToCheck) | where EmailDirection == "Outbound" | summarize OutboundInWindow = count(), ExternalRecipients = dcountif(RecipientEmailAddress, not(RecipientDomain has_any (InternalDomains))), FirstContactCount = countif(IsFirstContact == true), OutSubjects = make_set(Subject, 15) by OwUserKey = tolower(SenderFromAddress);
+// Reading the mailbox is how the attacker learns which invoice to intercept.
+let MailRead = OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where Operation in~ ("MailItemsAccessed","SearchQueryInitiatedExchange","MessageBind") | summarize MailAccessCount = count(), MailAccessIPs = make_set(ClientIP, 10) by MrUserKey = tolower(UserId);
+//
+OfficeActivity
+| where TimeGenerated >= ago(TimeToCheck)
+| where OfficeWorkload =~ "Exchange"
+| where Operation in~ (BecOps)
+| extend CleanIP = replace_regex(tostring(split(ClientIP, "]")[0]), @"[\[]", "")
+| extend CleanIP = iff(CleanIP contains ":" and CleanIP !contains "::", tostring(split(CleanIP, ":")[0]), CleanIP)
+// Parameters is a JSON array of {Name, Value}. Turn it into a bag so each
+// cmdlet argument can be read by name. An empty array would make mv-apply drop
+// the row, hence the substitution.
+| extend ParamList = iff(array_length(todynamic(Parameters)) > 0, todynamic(Parameters), dynamic([{}]))
+| mv-apply P = ParamList on ( summarize ParamBag = make_bag(bag_pack(tostring(P.Name), tostring(P.Value))) )
+| extend RuleName = coalesce(tostring(ParamBag.Name), tostring(ParamBag.Identity)), ForwardTo = tostring(ParamBag.ForwardTo), RedirectTo = tostring(ParamBag.RedirectTo), ForwardAsAttach = tostring(ParamBag.ForwardAsAttachmentTo), SmtpForwarding = tostring(ParamBag.ForwardingSmtpAddress), AddressForward = tostring(ParamBag.ForwardingAddress), MoveToFolder = tostring(ParamBag.MoveToFolder), DeleteMessage = tostring(ParamBag.DeleteMessage), MarkAsRead = tostring(ParamBag.MarkAsRead), StopProcessing = tostring(ParamBag.StopProcessingRules), SubjectContains = tostring(ParamBag.SubjectContainsWords), BodyContains = tostring(ParamBag.BodyContainsWords), SubjectOrBody = tostring(ParamBag.SubjectOrBodyContainsWords), FromAddress = tostring(ParamBag.From), GrantedTo = coalesce(tostring(ParamBag.User), tostring(ParamBag.Trustee)), GrantedRights = coalesce(tostring(ParamBag.AccessRights), tostring(ParamBag.AccessRight))
+| extend AllForwardTargets = trim(" ", strcat(ForwardTo, " ", RedirectTo, " ", ForwardAsAttach, " ", SmtpForwarding, " ", AddressForward)), RuleWords = tolower(strcat(SubjectContains, " ", BodyContains, " ", SubjectOrBody, " ", RuleName))
+| extend UserKey = tolower(UserId)
+| join kind=leftouter Job on $left.UserKey == $right.JobUserKey | join kind=leftouter SignInFromIP on $left.UserKey == $right.SiUserKey, $left.CleanIP == $right.SiIP | join kind=leftouter OutboundBaseline on $left.UserKey == $right.ObUserKey | join kind=leftouter OutboundWindow on $left.UserKey == $right.OwUserKey | join kind=leftouter MailRead on $left.UserKey == $right.MrUserKey
+| extend DaysSignedInFromIP = coalesce(DaysSignedInFromIP, 0), OutboundInWindow = coalesce(OutboundInWindow, 0), FirstContactCount = coalesce(FirstContactCount, 0), MailAccessCount = coalesce(MailAccessCount, 0)
+| extend ExternalForward = isnotempty(AllForwardTargets) and not(AllForwardTargets has_any (InternalDomains)), HidingRule = MoveToFolder has_any (HidingFolders) or DeleteMessage =~ "True" or (MarkAsRead =~ "True" and isnotempty(RuleWords)), FinanceRule = RuleWords has_any (FinanceWords), ThirdParty = isnotempty(MailboxOwnerUPN) and tolower(UserId) != tolower(MailboxOwnerUPN), NoSignInFromIP = DaysSignedInFromIP == 0, Delegation = isnotempty(GrantedTo), OutboundSpike = OutboundInWindow > (coalesce(NormalOutPerDay, 1.0) * 3)
+// Sum of indicators. The weighting is in docs/bec-playbook.md.
+| extend BecScore = toint(ExternalForward) * 3 + toint(HidingRule) * 3 + toint(FinanceRule) * 2 + toint(ThirdParty) * 2 + toint(NoSignInFromIP) * 2 + toint(OutboundSpike) * 2 + toint(Delegation)
+| where UserId contains UserIdentityCheck | where MailboxOwnerUPN contains MailboxCheck | where CleanIP contains IPtoCheck
+| project-rename EventTime = TimeGenerated
+| project EventTime, BecScore, Operation, ResultStatus, ExternalForward, HidingRule, FinanceRule, ThirdParty, NoSignInFromIP, OutboundSpike, Delegation, UserId, MailboxOwnerUPN, JobDetails, CleanIP, DaysSignedInFromIP, RuleName, AllForwardTargets, MoveToFolder, DeleteMessage, MarkAsRead, StopProcessing, SubjectContains, BodyContains, SubjectOrBody, FromAddress, GrantedTo, GrantedRights, OutboundInWindow, NormalOutPerDay, ExternalRecipients, FirstContactCount, OutSubjects, MailAccessCount, MailAccessIPs, ClientInfoString, OriginatingServer, ParamBag
+| sort by BecScore desc, EventTime desc
+//
+//| where ExternalForward                   // mail leaving the tenant
+//| where HidingRule and FinanceRule        // the classic invoice-fraud rule
+//| where ThirdParty                        // somebody else changed this mailbox
+//| summarize Mailboxes = dcount(MailboxOwnerUPN), Rules = count() by UserId, bin(EventTime, 1d)

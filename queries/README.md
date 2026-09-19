@@ -13,17 +13,28 @@
 | [`devicecode-timeline.kql`](devicecode-timeline.kql) | `SigninLogs`, non-interactive, service principal, `AuditLogs`, `OfficeActivity` | The device code incident as one timeline: delivery, code entry, token use, service principals, directory changes, cloud activity |
 | [`devicecode-persistence.kql`](devicecode-persistence.kql) | `AuditLogs`, `OfficeActivity`, service principal | What survives a password reset — MFA methods, app consent, service principal credentials, mailbox rules |
 | [`devicecode-scope.kql`](devicecode-scope.kql) | `SigninLogs`, non-interactive | Blast radius by IP, ASN, app or user agent. ASN is the one that finds the campaign |
+| [`bec.kql`](bec.kql) | `OfficeActivity` | BEC triage. Scores mailbox rules, forwarding and delegation for the hide-and-redirect pattern, against outbound volume and whether the actor signed in from that address |
+| [`bec-timeline.kql`](bec-timeline.kql) | `SigninLogs`, `OfficeActivity`, `EmailEvents`, `AuditLogs` | The BEC as one timeline: access, reconnaissance, mailbox change, outbound fraud, the hijacked thread, directory changes, files |
+| [`bec-persistence.kql`](bec-persistence.kql) | `OfficeActivity`, `AuditLogs` | Rules, forwarding, delegation, tenant-wide transport rules and directory footholds — everything a password reset leaves behind |
+| [`bec-scope.kql`](bec-scope.kql) | `OfficeActivity`, `EmailEvents`, `SigninLogs` | Other mailboxes forwarding to the same place, and every outside party who received the fraudulent thread |
+| [`attachment.kql`](attachment.kql) | `EmailAttachmentInfo`, `EmailEvents`, `Device*` | Attachment triage. Joins the mail verdict to the endpoint on `SHA256` — did it land, did it run |
+| [`attachment-timeline.kql`](attachment-timeline.kql) | `Email*`, `UrlClickEvents`, `Device*` | Delivery, attachment, links, clicks, ZAP and endpoint execution on one timeline, keyed off a message id or a hash |
+| [`attachment-scope.kql`](attachment-scope.kql) | `Email*`, `Device*` | Everyone who received the same file, sender or subject, and every device it reached or ran on |
 
 The first three are identity and activity tables and run in sequence.
 
-The `clickfix-*` and `devicecode-*` files are threat-specific and meant to be
-worked in order. Each set has a playbook carrying the attack timeline, the
+The `clickfix-*`, `devicecode-*`, `bec-*` and `attachment-*` files are
+threat-specific and meant to be worked in order. Each set has a playbook carrying the attack timeline, the
 phase-by-phase investigation, the containment order and the ticket checklist:
 
 - [`../docs/clickfix-playbook.md`](../docs/clickfix-playbook.md) — endpoint
   side, Win+R fake-CAPTCHA execution
 - [`../docs/devicecode-playbook.md`](../docs/devicecode-playbook.md) — identity
   side, OAuth device code phishing
+- [`../docs/bec-playbook.md`](../docs/bec-playbook.md) — mailbox side, business
+  email compromise and invoice fraud
+- [`../docs/attachment-playbook.md`](../docs/attachment-playbook.md) — mail and
+  endpoint, malicious attachments
 
 
 ## The order to run them in

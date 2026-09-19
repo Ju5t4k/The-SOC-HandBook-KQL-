@@ -1,0 +1,28 @@
+//Attachment scope query
+//
+// Who else. Fill in one indicator from attachment.kql and run.
+let TimeToCheck = 30d;
+let HashCheck = "";
+let SenderCheck = "";
+let SubjectCheck = "";
+let FileNameCheck = "";
+//
+let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, OSPlatform, DeviceType, OnboardingStatus, SensorHealthState;
+//
+union isfuzzy=true
+    // Every mailbox that received the same file, sender, subject or filename.
+    (EmailAttachmentInfo | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(HashCheck) and SHA256 =~ HashCheck) or (isnotempty(SenderCheck) and SenderFromAddress contains SenderCheck) or (isnotempty(FileNameCheck) and FileName contains FileNameCheck) | extend Hit = "Delivered", Who = RecipientEmailAddress, DeviceId = "", Evidence = strcat(FileName, " | SHA256=", SHA256, " | from ", SenderFromAddress, " | threats=", ThreatTypes)),
+    // Same subject, for campaigns that vary the attachment but not the lure.
+    (EmailEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(SubjectCheck) and Subject contains SubjectCheck) or (isnotempty(SenderCheck) and SenderFromAddress contains SenderCheck) | extend Hit = "Message", Who = RecipientEmailAddress, DeviceId = "", Evidence = strcat("from ", SenderFromAddress, " | ", Subject, " | ", LatestDeliveryAction, "/", LatestDeliveryLocation, " | cluster=", tostring(EmailClusterId))),
+    // The same file written to disk anywhere in the estate.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(HashCheck) and SHA256 =~ HashCheck | extend Hit = "OnDisk", Who = DeviceName, Evidence = strcat(ActionType, " | ", FolderPath, " | by ", InitiatingProcessFileName, " | origin=", FileOriginUrl)),
+    // The same file executed anywhere in the estate.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(HashCheck) and SHA256 =~ HashCheck | extend Hit = "Executed", Who = DeviceName, Evidence = strcat(AccountName, " | ", InitiatingProcessFileName, " -> ", FileName, " | ", ProcessCommandLine))
+| join kind=leftouter Machines on $left.DeviceId == $right.MiDeviceId
+| project-rename EventTime = TimeGenerated
+| project EventTime, Hit, Who, Evidence, OSPlatform, DeviceType, OnboardingStatus, SensorHealthState, DeviceId
+| sort by EventTime asc
+//
+//| where Hit in ("OnDisk","Executed")   // the ones that got past mail entirely
+//| summarize Hits = make_set(Hit, 4), First = min(EventTime), Last = max(EventTime) by Who
+//| summarize Recipients = dcount(Who), Events = count() by Hit, bin(EventTime, 1d)

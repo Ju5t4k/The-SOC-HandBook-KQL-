@@ -1,0 +1,41 @@
+//Attachment UserPrincipal query
+//
+let TimeToCheck = 7d;
+let RecipientCheck = "";
+let SenderCheck = "";
+let FileNameCheck = "";
+let HashCheck = "";
+//
+// Extensions that carry code or a container. Archives hide what is inside them
+// from the mail stack, which is the point of using them.
+let RiskyTypes = dynamic(["exe","scr","com","pif","bat","cmd","ps1","vbs","vbe","js","jse","wsf","wsh","hta","lnk","msi","msp","cpl","dll","jar","reg","iso","img","vhd","vhdx","cab","7z","ace","arj","rar","zip","gz","tar","one","xll","xlam","docm","xlsm","pptm","dotm","chm","url","svg"]);
+//
+// Did the same file land on an endpoint, and did it run?
+let OnDisk = DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(SHA256) | summarize OnDiskCount = count(), OnDiskDevices = dcount(DeviceId), OnDiskNames = make_set(DeviceName, 10), OnDiskPaths = make_set(FolderPath, 5), FirstOnDisk = min(TimeGenerated) by OdSHA256 = SHA256;
+let Executed = DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(SHA256) | summarize ExecCount = count(), ExecDevices = dcount(DeviceId), ExecNames = make_set(DeviceName, 10), ExecCmdLines = make_set(ProcessCommandLine, 5), FirstExecuted = min(TimeGenerated) by ExSHA256 = SHA256;
+// Was the message clicked, and did anything happen to it after delivery?
+let Clicks = UrlClickEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(NetworkMessageId) | summarize ClickCount = count(), ClickedThrough = countif(IsClickedThrough == true), ClickedUrls = make_set(Url, 5), Clickers = make_set(AccountUpn, 10) by ClNetworkMessageId = NetworkMessageId;
+let PostDelivery = EmailPostDeliveryEvents | where TimeGenerated >= ago(TimeToCheck) | summarize PostActions = make_set(ActionType, 5), PostResults = make_set(ActionResult, 5), LastPostAction = max(TimeGenerated) by PdNetworkMessageId = NetworkMessageId;
+// How many other mailboxes got the same file — one recipient or a campaign.
+let HashSpread = EmailAttachmentInfo | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(SHA256) | summarize RecipientsOfHash = dcount(RecipientEmailAddress), SendersOfHash = dcount(SenderFromAddress) by HsSHA256 = SHA256;
+//
+EmailAttachmentInfo
+| where TimeGenerated >= ago(TimeToCheck)
+| where RecipientEmailAddress contains RecipientCheck
+| where SenderFromAddress contains SenderCheck
+| where FileName contains FileNameCheck
+| where SHA256 contains HashCheck
+| join kind=inner ( EmailEvents | where TimeGenerated >= ago(TimeToCheck) | project NetworkMessageId, Subject, EmailDirection, DeliveryAction, DeliveryLocation, LatestDeliveryAction, LatestDeliveryLocation, SenderIPv4, SenderMailFromAddress, SenderFromDomain, RecipientDomain, AuthenticationDetails, IsFirstContact, EmailClusterId, AttachmentCount, UrlCount, MailThreatTypes = ThreatTypes, InternetMessageId ) on NetworkMessageId
+| join kind=leftouter OnDisk on $left.SHA256 == $right.OdSHA256 | join kind=leftouter Executed on $left.SHA256 == $right.ExSHA256 | join kind=leftouter Clicks on $left.NetworkMessageId == $right.ClNetworkMessageId | join kind=leftouter PostDelivery on $left.NetworkMessageId == $right.PdNetworkMessageId | join kind=leftouter HashSpread on $left.SHA256 == $right.HsSHA256
+| extend OnDiskCount = coalesce(OnDiskCount, 0), ExecCount = coalesce(ExecCount, 0), ClickCount = coalesce(ClickCount, 0), RecipientsOfHash = coalesce(RecipientsOfHash, 0)
+| extend MalwareVerdict = ThreatTypes has_any ("Malware","Phish"), ReachedInbox = LatestDeliveryLocation in~ ("Inbox/folder","Inbox"), RiskyType = tolower(FileExtension) in~ (RiskyTypes) or tolower(FileType) in~ (RiskyTypes), ReachedEndpoint = OnDiskCount > 0, WasExecuted = ExecCount > 0, AuthFailed = AuthenticationDetails has_any ("fail","softfail","none"), Campaign = RecipientsOfHash >= 5
+// Sum of indicators. The weighting is in docs/attachment-playbook.md.
+| extend AttachmentScore = toint(WasExecuted) * 3 + toint(ReachedEndpoint) * 3 + toint(MalwareVerdict and ReachedInbox) * 3 + toint(RiskyType) * 2 + toint(ClickCount > 0) * 2 + toint(MalwareVerdict) + toint(AuthFailed) + toint(IsFirstContact == true) + toint(Campaign)
+| project-rename EventTime = TimeGenerated
+| project EventTime, AttachmentScore, FileName, FileExtension, FileType, SHA256, FileSize, ThreatTypes, ThreatNames, MailThreatTypes, DetectionMethods, MalwareVerdict, RiskyType, ReachedInbox, DeliveryAction, DeliveryLocation, LatestDeliveryAction, LatestDeliveryLocation, PostActions, PostResults, LastPostAction, SenderFromAddress, SenderDisplayName, SenderMailFromAddress, SenderFromDomain, SenderIPv4, AuthenticationDetails, AuthFailed, IsFirstContact, RecipientEmailAddress, RecipientDomain, Subject, EmailDirection, RecipientsOfHash, SendersOfHash, Campaign, ReachedEndpoint, OnDiskCount, OnDiskDevices, OnDiskNames, OnDiskPaths, FirstOnDisk, WasExecuted, ExecCount, ExecDevices, ExecNames, ExecCmdLines, FirstExecuted, ClickCount, ClickedThrough, ClickedUrls, Clickers, AttachmentCount, UrlCount, EmailClusterId, NetworkMessageId, InternetMessageId
+| sort by AttachmentScore desc, EventTime desc
+//
+//| where WasExecuted                       // it ran — this is an endpoint incident now
+//| where MalwareVerdict and ReachedInbox   // detected and delivered anyway
+//| where RiskyType and not(MalwareVerdict) // risky container nobody flagged
+//| summarize Recipients = dcount(RecipientEmailAddress), Files = make_set(FileName, 10) by SenderFromAddress, bin(EventTime, 1d)

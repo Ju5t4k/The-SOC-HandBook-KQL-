@@ -21,6 +21,12 @@ docs/       playbooks and reference
   — attack timeline, six investigation phases with the query for each,
   containment order, and why revoking sessions matters more than resetting the
   password.
+- [Business email compromise — end-to-end investigation](docs/bec-playbook.md)
+  — attack timeline, seven investigation phases, containment order, and why the
+  tenant-wide transport rule is the one that gets missed.
+- [Malicious attachment — end-to-end investigation](docs/attachment-playbook.md)
+  — attack timeline, six investigation phases, and the `SHA256` join that turns
+  a mail hygiene problem into an endpoint incident.
 
 ## Using these
 

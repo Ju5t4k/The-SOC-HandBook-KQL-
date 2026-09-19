@@ -1,0 +1,30 @@
+//BEC persistence query
+//
+// What is still set on the mailbox. A password reset removes none of it.
+let TimeToCheck = 30d;
+let UserIdentityCheck = "";
+let MailboxCheck = "";
+//
+let RuleOps = dynamic(["New-InboxRule","Set-InboxRule","Enable-InboxRule","UpdateInboxRules"]);
+let ForwardOps = dynamic(["Set-Mailbox","Set-MailboxAutoReplyConfiguration"]);
+let DelegateOps = dynamic(["Add-MailboxPermission","Add-RecipientPermission","Set-MailboxFolderPermission","Add-MailboxFolderPermission","AddFolderPermissions","ModifyFolderPermissions"]);
+let TransportOps = dynamic(["New-TransportRule","Set-TransportRule","Enable-TransportRule"]);
+// Directory-side operations that keep the attacker authenticated.
+let DirectoryOps = dynamic(["User registered security info","Admin registered security info","Consent to application","Add delegated permission grant","Add app role assignment to service principal","Add service principal credentials","Add member to role","Add device","Register device"]);
+//
+union isfuzzy=true
+    (OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where Operation in~ (RuleOps) | extend Method = "Mailbox-Rule", Actor = UserId, ActorIP = ClientIP, Target = MailboxOwnerUPN, What = Operation, Outcome = ResultStatus, Evidence = Parameters),
+    (OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where Operation in~ (ForwardOps) | where Parameters has_any ("ForwardingSmtpAddress","ForwardingAddress","DeliverToMailboxAndForward","AutoReply") | extend Method = "Forwarding", Actor = UserId, ActorIP = ClientIP, Target = MailboxOwnerUPN, What = Operation, Outcome = ResultStatus, Evidence = Parameters),
+    (OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where Operation in~ (DelegateOps) | extend Method = "Delegation", Actor = UserId, ActorIP = ClientIP, Target = coalesce(MailboxOwnerUPN, TargetUserOrGroupName), What = Operation, Outcome = ResultStatus, Evidence = Parameters),
+    // Transport rules are tenant-wide and outlive the mailbox entirely.
+    (OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where Operation in~ (TransportOps) | extend Method = "Transport-Rule", Actor = UserId, ActorIP = ClientIP, Target = "tenant-wide", What = Operation, Outcome = ResultStatus, Evidence = Parameters),
+    (AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (DirectoryOps) | mv-expand TargetResources | extend Method = "Directory", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), ActorIP = tostring(InitiatedBy.user.ipAddress), Target = coalesce(tostring(TargetResources.userPrincipalName), tostring(TargetResources.displayName)), What = OperationName, Outcome = Result, Evidence = tostring(TargetResources.modifiedProperties))
+| where Actor contains UserIdentityCheck or Target contains UserIdentityCheck
+| where Target contains MailboxCheck or isempty(MailboxCheck)
+| project-rename EventTime = TimeGenerated
+| project EventTime, Method, What, Outcome, Actor, ActorIP, Target, Evidence
+| sort by EventTime desc
+//
+//| where Method == "Transport-Rule"   // tenant-wide, check this even if the mailbox looks clean
+//| where Method in ("Mailbox-Rule","Forwarding")
+//| summarize Changes = count(), Kinds = make_set(What, 15) by Actor, Method
