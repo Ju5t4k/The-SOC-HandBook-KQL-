@@ -15,8 +15,9 @@ docs/       playbooks and reference
 ### Playbooks
 
 - [ClickFix — end-to-end investigation](docs/clickfix-playbook.md) — attack
-  timeline, seven investigation phases with the query for each, containment
-  order, and what an empty result does not prove.
+  timeline, the six surfaces a victim can be told to paste into, ten
+  investigation phases with the query for each, containment order, and what an
+  empty result does not prove.
 - [Device code authentication — end-to-end investigation](docs/devicecode-playbook.md)
   — attack timeline, six investigation phases with the query for each,
   containment order, and why revoking sessions matters more than resetting the

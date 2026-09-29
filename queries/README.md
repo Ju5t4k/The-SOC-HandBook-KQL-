@@ -5,10 +5,12 @@
 | [`signinlogs.kql`](signinlogs.kql) | `SigninLogs` | Was this account used, and by whom. Job details, new-starter check, and day-counts for the IP, device, location, user agent and application |
 | [`auditlogs.kql`](auditlogs.kql) | `AuditLogs` | What did they change once they were in. Actor and target on every row, old and new values unpacked, and how routine the operation is for that actor |
 | [`officeactivity.kql`](officeactivity.kql) | `OfficeActivity` | What did they actually do to the data. Exchange, SharePoint, OneDrive and Teams activity with the source address scored against the account's sign-ins |
-| [`clickfix.kql`](clickfix.kql) | `DeviceProcessEvents` | One-shot ClickFix triage. Scores a process against the Win+R fake-CAPTCHA pattern and proves the paste from the `RunMRU` registry key |
-| [`clickfix-timeline.kql`](clickfix-timeline.kql) | `Device*`, `SigninLogs`, `OfficeActivity` | The ClickFix incident as one timeline, tagged by phase: lure, paste, execution, download, disk, persistence, defence, identity, cloud |
-| [`clickfix-persistence.kql`](clickfix-persistence.kql) | `Device*` | What was left behind — run keys, scheduled tasks, services, startup folder, LOLBin drops. The reimage decision |
-| [`clickfix-scope.kql`](clickfix-scope.kql) | `Device*` | Blast radius. Give it a URL, hash, command or IP and it finds every other device and user hit the same way |
+| [`clickfix.kql`](clickfix.kql) | `DeviceProcessEvents` | One-shot ClickFix triage. Scores a process against the fake-CAPTCHA pattern and proves the paste from the `RunMRU` and `TypedPaths` registry keys |
+| [`clickfix-paste.kql`](clickfix-paste.kql) | `DeviceProcessEvents`, `DeviceEvents`, `DeviceRegistryEvents` | The paste surfaces Win+R is not — the Explorer address bar, a browser-spawned shell, a console with no command line, a macOS Terminal. Run it when `clickfix.kql` is empty |
+| [`clickfix-timeline.kql`](clickfix-timeline.kql) | `Device*`, `UrlClickEvents`, `SigninLogs`, non-interactive, `AuditLogs`, `OfficeActivity` | The ClickFix incident as one timeline, tagged by phase: lure, paste, execution, download, disk, persistence, defence, identity, cloud |
+| [`clickfix-impact.kql`](clickfix-impact.kql) | `Device*` | What the payload took. Browser credential stores, LSASS, staged archives, exfil channels, RMM tooling and defence tampering |
+| [`clickfix-persistence.kql`](clickfix-persistence.kql) | `Device*` | What was left behind — run keys, tasks, services, startup folder, LOLBin drops, COM and shell hijacks, browser extensions. The reimage decision |
+| [`clickfix-scope.kql`](clickfix-scope.kql) | `Device*`, `EmailUrlInfo`, `UrlClickEvents` | Blast radius. Give it a URL, hash, command or IP and it finds every other device and user hit the same way — and everyone who was sent the lure but has not clicked yet |
 | [`devicecode.kql`](devicecode.kql) | `SigninLogs` | Device code phishing triage. Finds `AuthenticationProtocol == "deviceCode"` sign-ins and scores them, including whether the issued token was later used from a different ASN |
 | [`devicecode-timeline.kql`](devicecode-timeline.kql) | `SigninLogs`, non-interactive, service principal, `AuditLogs`, `OfficeActivity` | The device code incident as one timeline: delivery, code entry, token use, service principals, directory changes, cloud activity |
 | [`devicecode-persistence.kql`](devicecode-persistence.kql) | `AuditLogs`, `OfficeActivity`, service principal | What survives a password reset — MFA methods, app consent, service principal credentials, mailbox rules |
@@ -28,7 +30,7 @@ threat-specific and meant to be worked in order. Each set has a playbook carryin
 phase-by-phase investigation, the containment order and the ticket checklist:
 
 - [`../docs/clickfix-playbook.md`](../docs/clickfix-playbook.md) — endpoint
-  side, Win+R fake-CAPTCHA execution
+  side, fake-CAPTCHA paste-and-run execution
 - [`../docs/devicecode-playbook.md`](../docs/devicecode-playbook.md) — identity
   side, OAuth device code phishing
 - [`../docs/bec-playbook.md`](../docs/bec-playbook.md) — mailbox side, business

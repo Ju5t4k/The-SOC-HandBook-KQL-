@@ -9,23 +9,28 @@ let IPCheck = "";
 //
 let LolBins = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe"]);
 // Context: what the affected devices are.
-let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, OSPlatform, DeviceType, MachineGroup, OnboardingStatus, SensorHealthState;
+let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, OSPlatform, DeviceType, DeviceGroup = MachineGroup, OnboardingStatus, SensorHealthState;
 //
 union isfuzzy=true
     // The same command pasted on another device.
     (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ (LolBins) | where isnotempty(CommandCheck) and ProcessCommandLine contains CommandCheck | extend Hit = "Command", Evidence = ProcessCommandLine, Actor = AccountName),
-    // The same entry in the Run dialog.
-    (DeviceRegistryEvents | where TimeGenerated >= ago(TimeToCheck) | where RegistryKey has @"Explorer\RunMRU" | where isnotempty(CommandCheck) and RegistryValueData contains CommandCheck | extend Hit = "RunMRU", Evidence = RegistryValueData, Actor = InitiatingProcessAccountName),
+    // The same text pasted into Win+R or the Explorer address bar.
+    (DeviceRegistryEvents | where TimeGenerated >= ago(TimeToCheck) | where RegistryKey has @"Explorer\RunMRU" or RegistryKey has @"Explorer\TypedPaths" | where isnotempty(CommandCheck) and RegistryValueData contains CommandCheck | extend Hit = "Paste", Evidence = strcat(iff(RegistryKey has "RunMRU", "Win+R", "Explorer address bar"), ": ", RegistryValueData), Actor = InitiatingProcessAccountName),
     // Traffic to the same host.
     (DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(UrlCheck) and RemoteUrl contains UrlCheck) or (isnotempty(IPCheck) and RemoteIP contains IPCheck) | extend Hit = "Network", Evidence = strcat(InitiatingProcessFileName, " -> ", iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), ":", tostring(RemotePort)), Actor = InitiatingProcessAccountName),
     // The same file on disk.
     (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(HashCheck) and SHA256 =~ HashCheck) or (isnotempty(UrlCheck) and FileOriginUrl contains UrlCheck) | extend Hit = "File", Evidence = strcat(FolderPath, " | SHA256=", SHA256, " | origin=", FileOriginUrl), Actor = InitiatingProcessAccountName),
     // The same file executed.
-    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(HashCheck) and SHA256 =~ HashCheck | extend Hit = "Execution", Evidence = ProcessCommandLine, Actor = AccountName)
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(HashCheck) and SHA256 =~ HashCheck | extend Hit = "Execution", Evidence = ProcessCommandLine, Actor = AccountName),
+    // If the lure arrived by mail, endpoint telemetry only shows who opened it. This shows who got it.
+    (EmailUrlInfo | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(UrlCheck) and (Url contains UrlCheck or UrlDomain contains UrlCheck) | join kind=inner (EmailEvents | where TimeGenerated >= ago(TimeToCheck) | project NetworkMessageId, RecipientEmailAddress, SenderFromAddress, Subject, DeliveryAction, LatestDeliveryLocation) on NetworkMessageId | extend Hit = "Mail delivery", DeviceName = "", Actor = RecipientEmailAddress, Evidence = strcat(DeliveryAction, " to ", LatestDeliveryLocation, " | from ", SenderFromAddress, " | ", Subject, " | ", Url, iff(UrlLocation =~ "QRCode", " | delivered as a QR code", ""))),
+    // Who clicked it, and who clicked through the warning page anyway.
+    (UrlClickEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(UrlCheck) and Url contains UrlCheck | extend Hit = "Url click", DeviceName = "", Actor = AccountUpn, Evidence = strcat(ActionType, " from ", Workload, " | ", Url, " | verdict=", ThreatTypes, iff(IsClickedThrough, " | clicked through the warning", "")))
 | join kind=leftouter Machines on $left.DeviceId == $right.MiDeviceId
 | project-rename EventTime = TimeGenerated
-| project EventTime, Hit, DeviceName, Actor, Evidence, OSPlatform, DeviceType, MachineGroup, OnboardingStatus, SensorHealthState, DeviceId
+| project EventTime, Hit, DeviceName, Actor, Evidence, OSPlatform, DeviceType, DeviceGroup, OnboardingStatus, SensorHealthState, DeviceId
 | sort by EventTime asc
 //
-//| summarize Devices = dcount(DeviceId), Users = dcount(Actor), First = min(EventTime), Last = max(EventTime), Hits = make_set(Hit, 6) by bin(EventTime, 1d)  // campaign scale day by day
-//| summarize Hits = make_set(Hit, 6), First = min(EventTime) by DeviceName, Actor  // one line per device
+//| summarize Devices = dcount(DeviceId), Users = dcount(Actor), First = min(EventTime), Last = max(EventTime), Hits = make_set(Hit, 8) by bin(EventTime, 1d)  // campaign scale day by day
+//| where Hit in ("Mail delivery","Url click")   // the lure's reach, not the payload's
+//| summarize Hits = make_set(Hit, 8), First = min(EventTime) by DeviceName, Actor  // one line per device

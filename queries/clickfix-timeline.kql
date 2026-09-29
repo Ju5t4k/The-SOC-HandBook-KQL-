@@ -17,8 +17,13 @@ union isfuzzy=true
     // PHASE 1 — the lure. The page the command was copied from.
     (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType == "BrowserLaunchedToOpenUrl" | where isnotempty(RemoteUrl) | extend Phase = "1-Lure", Source = "DeviceEvents", Actor = AccountName, Detail = strcat("browser opened: ", RemoteUrl, " | ", InitiatingProcessFileName)),
     (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where InitiatingProcessFileName in~ (Browsers) | where isnotempty(RemoteUrl) | extend Phase = "1-Lure", Source = "DeviceNetworkEvents", Actor = InitiatingProcessAccountName, Detail = strcat("browser traffic: ", RemoteUrl, " (", RemoteIP, ":", tostring(RemotePort), ")")),
-    // PHASE 2 — the paste. RunMRU is proof the Run dialog was used.
-    (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where RegistryKey has @"Explorer\RunMRU" | where isnotempty(RegistryValueData) | extend Phase = "2-Paste", Source = "DeviceRegistryEvents", Actor = InitiatingProcessAccountName, Detail = strcat("RunMRU [", RegistryValueName, "] = ", RegistryValueData)),
+    // The lure can arrive by mail or Teams rather than by browsing. This is where that shows.
+    (UrlClickEvents | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "1-Lure", Source = "UrlClickEvents", DeviceName = "", Actor = AccountUpn, Detail = strcat("Safe Links click from ", Workload, ": ", Url, " | verdict=", ThreatTypes, " | ", ActionType, iff(IsClickedThrough, " | clicked through the warning", ""))),
+    // PHASE 2 — the paste. RunMRU proves the Run dialog; TypedPaths proves the Explorer address bar.
+    (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where RegistryKey has @"Explorer\RunMRU" or RegistryKey has @"Explorer\TypedPaths" | where isnotempty(RegistryValueData) | extend Phase = "2-Paste", Source = "DeviceRegistryEvents", Actor = InitiatingProcessAccountName, Detail = strcat(iff(RegistryKey has "RunMRU", "Win+R", "Explorer address bar"), " [", RegistryValueName, "] = ", RegistryValueData)),
+    // A console opened by the desktop with no arguments. The paste happened inside the window,
+    // so no command line exists — script block logging is the only record of what was typed.
+    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType == "PowerShellCommand" | extend Phase = "2-Paste", Source = "DeviceEvents", Actor = AccountName, Detail = strcat("console command: ", tostring(todynamic(AdditionalFields).Command))),
     // PHASE 3 — execution.
     (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where FileName in~ (LolBins) or InitiatingProcessFileName =~ "explorer.exe" | extend Phase = "3-Execution", Source = "DeviceProcessEvents", Actor = AccountName, Detail = strcat(InitiatingProcessFileName, " -> ", FileName, " | ", ProcessCommandLine)),
     // PHASE 4 — payload fetch. Traffic from something other than a browser.
@@ -31,6 +36,10 @@ union isfuzzy=true
     (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType in~ (DefenceActions) | extend Phase = "7-Defence", Source = "DeviceEvents", Actor = AccountName, Detail = strcat(ActionType, " | ", FileName, " | ", FolderPath)),
     // PHASE 8 — identity. Token theft shows here, not on the endpoint.
     (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "8-Identity", Source = "SigninLogs", DeviceName = tostring(DeviceDetail.displayName), Actor = UserPrincipalName, Detail = strcat("sign-in ", ResultType, " ", ResultDescription, " | ", IPAddress, " | ", tostring(LocationDetails.countryOrRegion), " | ", AppDisplayName)),
+    // Token replay does not look like a sign-in. It shows up here and nowhere else.
+    (AADNonInteractiveUserSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "8-Identity", Source = "AADNonInteractiveUserSignInLogs", DeviceName = tostring(todynamic(DeviceDetail).displayName), Actor = UserPrincipalName, Detail = strcat("token use ", ResultType, " | ", IPAddress, " | AS", AutonomousSystemNumber, " | ", tostring(todynamic(LocationDetails).countryOrRegion), " | ", AppDisplayName, " | ", IncomingTokenType)),
+    // What the stolen session was used to change: MFA methods, consent, roles, secrets.
+    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where OperationName has_any ("authentication method","consent","Add member to role","Add service principal","Add app role assignment","password","Register device","registered owner","Update user") | extend Phase = "8-Identity", Source = "AuditLogs", DeviceName = "", Actor = iff(isnotempty(tostring(InitiatedBy.user.userPrincipalName)), tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | target=", tostring(TargetResources[0].displayName))),
     // PHASE 9 — cloud. Mailbox rules, downloads, sharing.
     (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "9-Cloud", Source = "OfficeActivity", DeviceName = "", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP))
 // Cloud events carry no device name — DeviceCheck must not cut them out.
@@ -42,4 +51,5 @@ union isfuzzy=true
 //
 //| where Phase startswith "1-" or Phase startswith "2-"   // lure and paste only
 //| where Phase !startswith "8-" and Phase !startswith "9-" // endpoint only
+//| where Source == "AADNonInteractiveUserSignInLogs"       // token replay only
 //| summarize Events = count(), First = min(EventTime), Last = max(EventTime) by Phase  // how much of what in each phase

@@ -1,0 +1,57 @@
+//ClickFix paste surface query
+//
+// Win+R is the only surface that writes RunMRU. Run this when clickfix.kql comes
+// back empty but the story still says ClickFix — it covers the other surfaces.
+let TimeToCheck = 7d;
+let DeviceCheck = "";
+let UserIdentityCheck = "";
+let CommandCheck = "";
+let LinkWindow = 2m;
+//
+let Shells = dynamic(["powershell.exe","pwsh.exe","cmd.exe","wt.exe","WindowsTerminal.exe","openconsole.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe","msbuild.exe","installutil.exe","conhost.exe"]);
+let Browsers = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe","opera.exe","iexplore.exe","msedgewebview2.exe"]);
+let UnixShells = dynamic(["bash","zsh","sh","dash","osascript","curl","wget","python3","Terminal","iTerm2"]);
+// A Unix one-liner that fetches and runs in one breath. Plain curl on its own is not enough.
+let UnixPipeToShell = @"\|\s*(ba|z)?sh\b";
+let UnixLureWords = dynamic(["do shell script","base64 -d","base64 --decode","-fsSL","--output -"]);
+let DownloadWords = dynamic(["iex","invoke-expression","iwr","invoke-webrequest","invoke-restmethod","irm","downloadstring","downloadfile","webclient","curl","wget","bitstransfer","urlcache","frombase64string","do shell script"]);
+let StealthWords = dynamic(["hidden","windowstyle","bypass","noprofile","nop","encodedcommand","-enc ","noninteractive","unrestricted","-w h"]);
+//
+// The two paste surfaces that write readable text. Everything else writes binary or nothing.
+let Pastes = DeviceRegistryEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(RegistryValueData) | where RegistryKey has @"Explorer\RunMRU" or RegistryKey has @"Explorer\TypedPaths" | extend PasteSurface = iff(RegistryKey has "RunMRU", "Win+R", "Explorer address bar") | project PsDeviceId = DeviceId, PasteTime = TimeGenerated, PasteSurface, PastedText = trim_end(@"\\1", RegistryValueData);
+let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, OSPlatform, DeviceType, OnboardingStatus, SensorHealthState;
+//
+union isfuzzy=true
+    // A shell or LOLBin started by the desktop or by a browser. Covers Win+R, the Explorer
+    // address bar, the file-open dialog and protocol-handler variants in one predicate.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ (Shells) | where InitiatingProcessFileName =~ "explorer.exe" or InitiatingProcessFileName in~ (Browsers) or InitiatingProcessParentFileName =~ "explorer.exe" or InitiatingProcessParentFileName in~ (Browsers) | extend Source = "DeviceProcessEvents", Actor = AccountName, RanFile = FileName, RanCommand = ProcessCommandLine, ParentFile = InitiatingProcessFileName, GrandparentFile = InitiatingProcessParentFileName),
+    // Typed or pasted straight into an open console. There is no process command line for these
+    // at all. Needs PowerShell script block logging — empty here means logging is off, not clean.
+    (DeviceEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType == "PowerShellCommand" | extend Source = "DeviceEvents", Actor = AccountName, RanFile = InitiatingProcessFileName, RanCommand = tostring(todynamic(AdditionalFields).Command), ParentFile = InitiatingProcessParentFileName, GrandparentFile = ""),
+    // macOS and Linux. "Paste this into Terminal" is the same attack with a different shell.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ (UnixShells) | where ProcessCommandLine matches regex UnixPipeToShell or ProcessCommandLine has_any (UnixLureWords) | extend Source = "DeviceProcessEvents", Actor = AccountName, RanFile = FileName, RanCommand = ProcessCommandLine, ParentFile = InitiatingProcessFileName, GrandparentFile = InitiatingProcessParentFileName)
+| where DeviceName contains DeviceCheck
+| where Actor contains UserIdentityCheck
+| where RanCommand contains CommandCheck
+| project-rename EventTime = TimeGenerated
+| join kind=leftouter Pastes on $left.DeviceId == $right.PsDeviceId
+// Keep only a paste that came shortly before this execution, then keep the latest such paste.
+| extend Linked = isnotempty(PasteTime) and PasteTime <= EventTime and PasteTime > (EventTime - LinkWindow)
+| extend PasteTime = iff(Linked, PasteTime, datetime(null)), PastedText = iff(Linked, PastedText, ""), PasteSurface = iff(Linked, PasteSurface, "")
+| extend PasteRank = coalesce(PasteTime, datetime(1601-01-01))
+| summarize arg_max(PasteRank, *) by ExecKey = strcat(DeviceId, "|", tostring(ReportId), "|", Source)
+| extend PasteArgs = extract(@"^\S+\s+(.*)$", 1, PastedText)
+| extend TextMatch = isnotempty(PastedText) and ((isnotempty(PasteArgs) and RanCommand contains PasteArgs) or RanCommand contains PastedText)
+| extend SecondsFromPaste = iff(isnotempty(PasteTime), datetime_diff("second", EventTime, PasteTime), int(null))
+| extend ParentIsExplorer = ParentFile =~ "explorer.exe" or GrandparentFile =~ "explorer.exe", ParentIsBrowser = ParentFile in~ (Browsers) or GrandparentFile in~ (Browsers), BareShell = strlen(RanCommand) <= 40
+| extend Surface = case(TextMatch, PasteSurface, isnotempty(PasteSurface), strcat(PasteSurface, " (unmatched)"), ParentIsBrowser, "Browser spawned", Source == "DeviceEvents", "Console typed or pasted", RanFile in~ (UnixShells), "Unix shell", BareShell and ParentIsExplorer, "Interactive shell, no command line", "Other")
+| extend HasDownload = RanCommand has_any (DownloadWords), HasStealth = RanCommand has_any (StealthWords), HasBase64 = RanCommand matches regex @"[A-Za-z0-9+/]{40,}={0,2}"
+| join kind=leftouter Machines on $left.DeviceId == $right.MiDeviceId
+| project EventTime, Surface, TextMatch, SecondsFromPaste, DeviceName, Actor, RanFile, RanCommand, PastedText, PasteTime, ParentFile, GrandparentFile, ParentIsExplorer, ParentIsBrowser, BareShell, HasDownload, HasStealth, HasBase64, Source, OSPlatform, DeviceType, OnboardingStatus, SensorHealthState, DeviceId
+| sort by EventTime desc
+//
+//| where TextMatch                                  // the paste and the command are the same string
+//| where Surface != "Other"                         // drop the ones no surface explains
+//| where SecondsFromPaste <= 10                     // paste to execution in seconds, which is the tell
+//| where isempty(PastedText) and HasDownload        // executed a download with no registry artefact at all
+//| summarize Runs = count(), Devices = dcount(DeviceId), Users = dcount(Actor) by Surface  // which surface is being used

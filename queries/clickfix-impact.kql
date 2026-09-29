@@ -1,0 +1,52 @@
+//ClickFix payload impact query
+//
+// What the payload did once it ran. This is the phase that decides whether the
+// incident ends at the endpoint or moves to identity.
+let TimeToCheck = 7d;
+let DeviceCheck = "";
+let UserIdentityCheck = "";
+//
+let LolBins = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe","msbuild.exe","installutil.exe"]);
+let Browsers = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe","opera.exe","iexplore.exe","msedgewebview2.exe","chrome","firefox","Safari"]);
+// Browser credential and session stores. A stealer copies these out because they are locked in place.
+let CredFiles = dynamic(["Login Data","Login Data For Account","Web Data","Local State","Cookies","Network Cookies","logins.json","key4.db","key3.db","cookies.sqlite","places.sqlite","signons.sqlite"]);
+let CredPaths = dynamic([@"\User Data\Default\",@"\User Data\Profile",@"\Mozilla\Firefox\Profiles\",@"\Login Data",@"\Network\Cookies","/Library/Application Support/Google/Chrome/","/Library/Keychains/"]);
+// Dead drops and file-sharing services that stealers post to. Extend with what you see.
+let ExfilHosts = dynamic(["api.telegram.org","discord.com","discordapp.com","cdn.discordapp.com","pastebin.com","paste.ee","gofile.io","anonfiles.com","transfer.sh","bashupload.com","tmpfiles.org","catbox.moe","filebin.net","steamcommunity.com","0x0.st"]);
+// Remote access tooling. A second stage that is not malware and will not be flagged as malware.
+let RmmNames = dynamic(["screenconnect","connectwise","anydesk","atera","netsupport","client32","teamviewer","rustdesk","meshagent","splashtop","syncro","action1","logmein","gotoassist","dwagent","supremo","ultraviewer","pdqdeploy","tightvnc","ngrok","cloudflared"]);
+let DiscoveryCmds = dynamic(["whoami","systeminfo","net user","net group","net localgroup","nltest","ipconfig /all","tasklist","query user","wmic csproduct","Get-ADUser","Get-ADDomain","arp -a","route print"]);
+let ArchiveTools = dynamic(["rar.exe","7z.exe","7za.exe","winrar.exe","zip.exe","tar.exe","makecab.exe"]);
+let StagePaths = dynamic([@"\appdata\",@"\temp\",@"\programdata\",@"\public\","/tmp/","/var/folders/"]);
+//
+union isfuzzy=true
+    // Credential stores copied out of a browser profile by something that is not that browser.
+    // Defender does not log reads, so the copy is the artefact — a new file with a store's name.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where FileName in~ (CredFiles) or FolderPath has_any (CredPaths) | where InitiatingProcessFileName !in~ (Browsers) | where isnotempty(InitiatingProcessFileName) | extend Hit = "Credential store", Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, " ", FolderPath, " | SHA256=", SHA256), RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine),
+    // The browser killed first, so the locked database can be copied.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ ("taskkill.exe","kill","pkill","killall") or ProcessCommandLine has_any ("Stop-Process","taskkill") | where ProcessCommandLine has_any (Browsers) | extend Hit = "Browser killed", Actor = AccountName, Evidence = ProcessCommandLine, RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine),
+    // LSASS opened or read. Credential theft that is not about the browser.
+    (DeviceEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType in~ ("OpenProcessApiCall","ReadProcessMemoryApiCall","AsrLsassCredentialTheftBlocked","AsrLsassCredentialTheftAudited") | where FileName =~ "lsass.exe" or ActionType startswith "AsrLsass" | extend Hit = "LSASS access", Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, " on ", FileName), RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine),
+    // Collected data staged into an archive before it leaves.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ (ArchiveTools) or ProcessCommandLine has_any ("Compress-Archive","ZipFile]::CreateFromDirectory") | where ProcessCommandLine has_any (StagePaths) | extend Hit = "Staged archive", Actor = AccountName, Evidence = ProcessCommandLine, RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine),
+    // The channel it went out on. Not a browser, so not the user browsing.
+    (DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where RemoteUrl has_any (ExfilHosts) | where InitiatingProcessFileName !in~ (Browsers) | extend Hit = "Exfil channel", Actor = InitiatingProcessAccountName, Evidence = strcat(InitiatingProcessFileName, " -> ", RemoteUrl, " (", RemoteIP, ":", tostring(RemotePort), ")"), RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine),
+    // Remote access tooling installed as the second stage. Different containment to a stealer.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where ProcessCommandLine has_any (RmmNames) or FileName has_any (RmmNames) | extend Hit = "Remote access tool", Actor = AccountName, Evidence = strcat(FolderPath, " | ", ProcessCommandLine), RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine),
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType in~ ("FileCreated","FileRenamed") | where FileName has_any (RmmNames) or FolderPath has_any (RmmNames) | extend Hit = "Remote access tool", Actor = InitiatingProcessAccountName, Evidence = strcat(FolderPath, " | SHA256=", SHA256, " | origin=", FileOriginUrl), RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine),
+    // Host reconnaissance run by a LOLBin rather than by an administrator.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where ProcessCommandLine has_any (DiscoveryCmds) | where InitiatingProcessFileName in~ (LolBins) | extend Hit = "Discovery", Actor = AccountName, Evidence = ProcessCommandLine, RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine),
+    // Defences turned off or excluded. Almost always the payload clearing its own path.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where ProcessCommandLine has_any ("Add-MpPreference","Set-MpPreference","ExclusionPath","ExclusionExtension","ExclusionProcess","DisableRealtimeMonitoring","DisableBehaviorMonitoring","DisableIOAVProtection","Uninstall-WindowsFeature Windows-Defender","netsh advfirewall set","bcdedit","vssadmin delete") | extend Hit = "Defence tampering", Actor = AccountName, Evidence = ProcessCommandLine, RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine),
+    (DeviceEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType in~ ("TamperingAttempt","AntivirusConfigurationChange","SecurityControlConfigurationChange","AntivirusScanCancelled","ExploitGuardNonMicrosoftSignedBlocked") | extend Hit = "Defence tampering", Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, " | ", FileName, " | ", FolderPath), RanBy = InitiatingProcessFileName, RanByCmd = InitiatingProcessCommandLine)
+| where DeviceName contains DeviceCheck
+| where Actor contains UserIdentityCheck
+| project-rename EventTime = TimeGenerated
+| project EventTime, Hit, DeviceName, Actor, Evidence, RanBy, RanByCmd, DeviceId
+| sort by EventTime asc
+//
+//| where Hit == "Credential store"                  // the one that decides whether you revoke tokens
+//| where Hit in ("Credential store","LSASS access","Exfil channel")  // theft only
+//| where RanBy in~ (LolBins)                        // only what a LOLBin did, not an installer
+//| summarize Hits = make_set(Hit, 10), First = min(EventTime), Last = max(EventTime) by DeviceName, Actor  // one line per device
+//| summarize Devices = dcount(DeviceId), Users = dcount(Actor) by Hit  // which impacts, across the estate
