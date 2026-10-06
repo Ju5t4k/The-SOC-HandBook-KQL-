@@ -28,6 +28,11 @@ docs/       playbooks and reference
 - [Malicious attachment — end-to-end investigation](docs/attachment-playbook.md)
   — attack timeline, six investigation phases, and the `SHA256` join that turns
   a mail hygiene problem into an endpoint incident.
+- [Hands-on-keyboard intrusion — end-to-end investigation](docs/hok-playbook.md)
+  — for new and experienced analysts: twelve phases from "is someone still
+  here" to the root cause analysis, connections before, during and after,
+  IOC and IOA collection, and how to collect from the Defender portal without
+  a query.
 
 ## Using these
 

@@ -1,0 +1,61 @@
+//Hands-on-keyboard data exfiltration query
+//
+// Every channel data can leave by that Defender can see: transfer tools, cloud storage,
+// tunnels, sustained connections, removable media, cloud downloads and sharing, and mail.
+// Defender records connections, not bytes. Read "how much" from the files and archives, not from here.
+let IncidentStart = ago(1d);              // first known attacker activity, e.g. datetime(2026-10-05T14:32:00Z)
+let IncidentEnd = now();
+let LookBefore = 1d;
+let LookAfter = 3d;
+let DeviceCheck = "";
+let UserIdentityCheck = "";
+let InternalDomains = dynamic(["contoso.com"]);   // CHANGE THIS — every internal domain, or all mail looks external
+let PrevalenceWindow = 30d;
+let SustainedThreshold = 50;              // connections per hour from one process to one destination
+//
+let StartTime = IncidentStart - LookBefore;
+let EndTime = IncidentEnd + LookAfter;
+let Browsers = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe","opera.exe","iexplore.exe","msedgewebview2.exe"]);
+let ExfilToolPattern = @"(?i)(rclone|megacmd|mega-put|megasync|winscp|filezilla|pscp|psftp|restic|azcopy|s3browser|gsutil|cyberduck)";
+let UploadPattern = @"(?i)(curl(\.exe)?\s.*(\s-T\s|--upload-file|\s-F\s|--form|--data-binary\s+@)|invoke-(webrequest|restmethod).*-infile|-transfertype\s+upload|bitsadmin(\.exe)?\s.*/upload|ftp(\.exe)?\s+-s:|wget(\.exe)?\s.*--post-file|aws\s+s3\s+(cp|sync|mv)|scp(\.exe)?\s.*\S+@\S+:)";
+let TunnelPattern = @"(?i)(ngrok|cloudflared|chisel|plink(\.exe)?\s.*-R\s|ssh(\.exe)?\s.*-R\s|frpc|gost|ligolo)";
+// File-sharing and storage services. Legitimate in many estates; what matters is which process used them.
+let StorageHosts = dynamic(["mega.nz","mega.io","mega.co.nz","dropbox.com","dropboxusercontent.com","drive.google.com","storage.googleapis.com","onedrive.live.com","box.com","wetransfer.com","sendspace.com","mediafire.com","gofile.io","file.io","transfer.sh","temp.sh","pixeldrain.com","catbox.moe","anonfiles.com","bashupload.com","filebin.net","pcloud.com","icedrive.net","s3.amazonaws.com","api.telegram.org","discord.com","pastebin.com"]);
+let ArchiveTypes = @"(?i)\.(zip|7z|rar|tar|gz|tgz|cab)$";
+//
+let Rows = materialize(union isfuzzy=true
+    // Transfer tooling run on the device. rclone with a remote is the single most common exfil tool in these cases.
+    (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where FileName matches regex ExfilToolPattern or ProcessCommandLine matches regex ExfilToolPattern or ProcessCommandLine matches regex UploadPattern | extend Url = extract(@"(?i)((?:https?|ftp|sftp)://[^\s\x22\x27]+|\S+@[\w.-]+:\S*)", 1, ProcessCommandLine), RcloneRemote = extract(@"(?i)rclone(?:\.exe)?\x22?\s+(?:copy|sync|move|copyto|moveto)\s+\S+\s+([A-Za-z0-9_.-]{2,}):", 1, ProcessCommandLine) | extend Channel = "Transfer tool", Technique = iff(ProcessCommandLine has_any ("rclone","mega","s3","azcopy","gsutil"), "T1567.002", "T1048"), Actor = AccountName, Destination = iff(isnotempty(Url), Url, iff(isnotempty(RcloneRemote), strcat("rclone remote ", RcloneRemote), "")), Evidence = ProcessCommandLine, RanBy = InitiatingProcessFileName),
+    // rclone's config file names the remote, and so the destination account.
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where FileName =~ "rclone.conf" or FolderPath has @"\rclone\" | extend Channel = "Transfer tool config", Technique = "T1567.002", Actor = InitiatingProcessAccountName, Destination = "", Evidence = strcat(ActionType, " ", FolderPath), RanBy = InitiatingProcessFileName),
+    // Tunnels and reverse SSH. A way out that also brings the operator back in.
+    (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where FileName matches regex TunnelPattern or ProcessCommandLine matches regex TunnelPattern | extend Channel = "Tunnel", Technique = "T1572", Actor = AccountName, Destination = "", Evidence = ProcessCommandLine, RanBy = InitiatingProcessFileName),
+    // Storage and sharing services reached by anything other than a browser.
+    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType =~ "ConnectionSuccess" | where RemoteUrl has_any (StorageHosts) | where InitiatingProcessFileName !in~ (Browsers) | summarize TimeGenerated = min(TimeGenerated), Connections = count() by DeviceName, Actor = InitiatingProcessAccountName, RanBy = InitiatingProcessFileName, Destination = RemoteUrl, Slot = bin(TimeGenerated, 1h) | extend Channel = "Storage service (non-browser)", Technique = "T1567.002", Evidence = strcat(Connections, " connections in the hour")),
+    // Defender has no byte counts. A process hammering one public destination for an hour is the nearest proxy.
+    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType =~ "ConnectionSuccess" and RemoteIPType == "Public" | where InitiatingProcessFileName !in~ (Browsers) | summarize TimeGenerated = min(TimeGenerated), Connections = count() by DeviceName, Actor = InitiatingProcessAccountName, RanBy = InitiatingProcessFileName, Destination = iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), Slot = bin(TimeGenerated, 1h) | where Connections >= SustainedThreshold | extend Channel = "Sustained connection", Technique = "T1041", Evidence = strcat(Connections, " connections in the hour")),
+    // Archives written just before. Not exfil on its own; it is what the exfil carried.
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where FileName matches regex ArchiveTypes | where InitiatingProcessFileName !in~ ("msiexec.exe","TrustedInstaller.exe","MsMpEng.exe","svchost.exe") | extend Channel = "Staged archive", Technique = "T1074.001", Actor = InitiatingProcessAccountName, Destination = "", Evidence = strcat(FolderPath, " | ", FileSize, " bytes"), RanBy = InitiatingProcessFileName),
+    // Removable media, and what device control saw being written to it.
+    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("UsbDriveMount","UsbDriveMounted","RemovableStoragePolicyTriggered","RemovableStorageFileEvent") | extend Channel = "Removable media", Technique = "T1052.001", Actor = iff(isnotempty(InitiatingProcessAccountName), InitiatingProcessAccountName, AccountName), Destination = tostring(todynamic(AdditionalFields).DriveLetter), Evidence = strcat(ActionType, " | ", tostring(AdditionalFields)), RanBy = InitiatingProcessFileName),
+    // SharePoint and OneDrive: bulk downloads, and links that let anyone fetch the file.
+    (CloudAppEvents | where TimeGenerated between (StartTime .. EndTime) | where isnotempty(UserIdentityCheck) | where ActionType in~ ("FileDownloaded","FileSyncDownloadedFull") | extend Actor = iff(isnotempty(tostring(RawEventData.UserId)), tostring(RawEventData.UserId), AccountDisplayName) | where Actor contains UserIdentityCheck | summarize TimeGenerated = min(TimeGenerated), Files = count(), Sample = make_set(ObjectName, 5) by Actor, IPAddress, ISP, Slot = bin(TimeGenerated, 1h) | where Files >= 20 | extend Channel = "Cloud bulk download", Technique = "T1530", DeviceName = "", Destination = strcat(IPAddress, " ", ISP), Evidence = strcat(Files, " files in the hour: ", strcat_array(Sample, " ; ")), RanBy = ""),
+    (CloudAppEvents | where TimeGenerated between (StartTime .. EndTime) | where isnotempty(UserIdentityCheck) | where ActionType in~ ("AnonymousLinkCreated","AnonymousLinkUsed","SharingInvitationCreated","SharingSet","AddedToSecureLink") | extend Actor = iff(isnotempty(tostring(RawEventData.UserId)), tostring(RawEventData.UserId), AccountDisplayName) | where Actor contains UserIdentityCheck | extend Channel = "Cloud sharing", Technique = "T1567", DeviceName = "", Destination = tostring(RawEventData.TargetUserOrGroupName), Evidence = strcat(ActionType, " | ", ObjectName), RanBy = strcat(IPAddress, " ", ISP)),
+    // Mail with attachments to outside addresses.
+    (EmailEvents | where TimeGenerated between (StartTime .. EndTime) | where isnotempty(UserIdentityCheck) | where SenderFromAddress contains UserIdentityCheck | where EmailDirection =~ "Outbound" and AttachmentCount > 0 | where RecipientDomain !in~ (InternalDomains) | extend Channel = "Mail out", Technique = "T1048", DeviceName = "", Actor = SenderFromAddress, Destination = RecipientEmailAddress, Evidence = strcat(AttachmentCount, " attachments | ", Subject), RanBy = "")
+| where Actor contains UserIdentityCheck
+| extend Window = case(TimeGenerated < IncidentStart, "1-Before", TimeGenerated <= IncidentEnd, "2-During", "3-After"));
+// How common each internet destination is across the estate. A destination nobody else uses is the one to read first.
+let Destinations = Rows | where Channel in ("Storage service (non-browser)","Sustained connection") | distinct Destination;
+let Prevalence = DeviceNetworkEvents | where TimeGenerated > ago(PrevalenceWindow) | where RemoteIPType == "Public" | extend Destination = iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP) | where Destination in (Destinations) | summarize OrgDevices = dcount(DeviceId) by Destination;
+//
+Rows
+| join kind=leftouter Prevalence on Destination
+| project-rename EventTime = TimeGenerated
+| project EventTime, Window, Channel, Technique, DeviceName, Actor, Destination, OrgDevices, Evidence, RanBy
+| sort by EventTime asc
+//
+//| where Channel != "Staged archive"                            // the leaving, not the packing
+//| where Channel == "Sustained connection" and OrgDevices <= 2  // heavy traffic to somewhere almost nobody else talks to
+//| where Window == "3-After"                                    // still leaving after you thought it was over
+//| summarize First = min(EventTime), Last = max(EventTime), Rows = count() by Channel, Destination  // one line per way out

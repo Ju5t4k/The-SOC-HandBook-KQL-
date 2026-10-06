@@ -22,10 +22,20 @@
 | [`attachment.kql`](attachment.kql) | `EmailAttachmentInfo`, `EmailEvents`, `Device*` | Attachment triage. Joins the mail verdict to the endpoint on `SHA256` — did it land, did it run |
 | [`attachment-timeline.kql`](attachment-timeline.kql) | `Email*`, `UrlClickEvents`, `Device*` | Delivery, attachment, links, clicks, ZAP and endpoint execution on one timeline, keyed off a message id or a hash |
 | [`attachment-scope.kql`](attachment-scope.kql) | `Email*`, `Device*` | Everyone who received the same file, sender or subject, and every device it reached or ran on |
+| [`hok.kql`](hok.kql) | `Device*` | Hands-on-keyboard triage. Is a person driving this device, and are they still on it? Eleven indicators, scored, with `ActiveNow` |
+| [`hok-timeline.kql`](hok-timeline.kql) | `Device*`, `IdentityQueryEvents` | The intrusion on one device in ten phases, every row tagged with an ATT&CK technique — the IOA list |
+| [`hok-connections.kql`](hok-connections.kql) | `Device*`, `IdentityLogonEvents` | Every connection in and out, tagged before, during and after, with internal addresses resolved and internet destinations scored for rarity |
+| [`hok-web.kql`](hok-web.kql) | `Device*`, `UrlClickEvents` | Browsing, downloads with the page that linked them, command-line downloads, SmartScreen, network protection, Safe Links |
+| [`hok-lateral.kql`](hok-lateral.kql) | `Device*`, `Identity*` | Hops out of the device seen from both ends and from the domain controller, plus everywhere the account logged on |
+| [`hok-files.kql`](hok-files.kql) | `DeviceFileEvents`, `DeviceEvents`, `CloudAppEvents` | Files opened, dropped, archived, changed over SMB, deleted, renamed, labelled, copied to removable media, pulled from SharePoint |
+| [`hok-exfil.kql`](hok-exfil.kql) | `Device*`, `CloudAppEvents`, `EmailEvents` | Transfer tools, tunnels, storage services, sustained connections, removable media, cloud downloads and sharing, mail out |
+| [`hok-iocs.kql`](hok-iocs.kql) | `AlertEvidence`, `Device*` | Every indicator from the window in one table — alert evidence plus rare hashes, destinations, URLs, accounts, persistence names and command lines |
+| [`hok-scope.kql`](hok-scope.kql) | `Device*`, `Identity*`, `CloudAppEvents`, `Email*` | Any indicator from `hok-iocs.kql`, swept across the estate |
+| [`hok-enrich-ah.kql`](hok-enrich-ah.kql) | Advanced Hunting only | `FileProfile()` on every file the device ran or wrote: global prevalence, first seen, signer |
 
 The first three are identity and activity tables and run in sequence.
 
-The `clickfix-*`, `devicecode-*`, `bec-*` and `attachment-*` files are
+The `clickfix-*`, `devicecode-*`, `bec-*`, `attachment-*` and `hok-*` files are
 threat-specific and meant to be worked in order. Each set has a playbook carrying the attack timeline, the
 phase-by-phase investigation, the containment order and the ticket checklist:
 
@@ -37,6 +47,9 @@ phase-by-phase investigation, the containment order and the ticket checklist:
   email compromise and invoice fraud
 - [`../docs/attachment-playbook.md`](../docs/attachment-playbook.md) — mail and
   endpoint, malicious attachments
+- [`../docs/hok-playbook.md`](../docs/hok-playbook.md) — a person operating
+  inside the estate: connections, web, files, lateral movement, exfiltration,
+  IOCs and IOAs, and the root cause analysis
 
 
 ## The order to run them in

@@ -1,0 +1,53 @@
+//Hands-on-keyboard connections query
+//
+// Everything that connected to this device, and everything it connected to, tagged
+// Before, During or After the incident. Browsers are left out — that is hok-web.kql.
+let IncidentStart = ago(1d);              // first known attacker activity, e.g. datetime(2026-10-05T14:32:00Z)
+let IncidentEnd = now();                  // last known activity, or now() if it is still going on
+let LookBefore = 7d;
+let LookAfter = 1d;
+let DeviceCheck = "";                     // the device under investigation — fill this in
+let UserIdentityCheck = "";
+let PrevalenceWindow = 30d;
+//
+let StartTime = IncidentStart - LookBefore;
+let EndTime = IncidentEnd + LookAfter;
+let Browsers = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe","opera.exe","iexplore.exe","msedgewebview2.exe"]);
+let QuietListeners = dynamic(["svchost.exe","System","lsass.exe","services.exe","wininit.exe","spoolsv.exe","MsMpEng.exe","MsSense.exe"]);
+// Internal address to device name, as Defender saw it across the window. DHCP churn can give more than one.
+let IpToDevice = DeviceNetworkInfo | where TimeGenerated between (StartTime .. EndTime) | mv-expand IPEntry = IPAddresses | extend IP = tostring(IPEntry.IPAddress) | where isnotempty(IP) | summarize ResolvedDevice = strcat_array(make_set(DeviceName, 3), " / ") by IP;
+//
+let Rows = materialize(union isfuzzy=true
+    // Logons to this device. Network logons are SMB, WinRM, PsExec and friends; NewCredentials is runas /netonly.
+    (DeviceLogonEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | extend Direction = iff(isnotempty(RemoteIP) and RemoteIP !in ("127.0.0.1","::1","-"), "Inbound logon", "Local logon"), Channel = case(LogonType =~ "RemoteInteractive", "RDP", LogonType startswith "Network", "Network logon", LogonType =~ "NewCredentials", "NewCredentials (runas /netonly)", LogonType =~ "Interactive", "Console", LogonType =~ "Batch", "Scheduled task", LogonType =~ "Service", "Service", LogonType), Remote = iff(isnotempty(RemoteDeviceName), RemoteDeviceName, RemoteIP), Account = strcat(AccountDomain, "\\", AccountName), Process = InitiatingProcessFileName, Result = iff(isnotempty(FailureReason), strcat(ActionType, ": ", FailureReason), strcat(ActionType, iff(IsLocalAdmin == true, " (local admin)", ""))), PortStr = tostring(RemotePort)),
+    // RDP as the process telemetry saw it. Catches sessions whose logon events were thin or missing.
+    (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where IsProcessRemoteSession == true | extend Direction = "Inbound session", Channel = "RDP (process)", RemoteIP = ProcessRemoteSessionIP, Remote = iff(isnotempty(ProcessRemoteSessionDeviceName), ProcessRemoteSessionDeviceName, ProcessRemoteSessionIP), Account = strcat(AccountDomain, "\\", AccountName), Process = FileName, Result = "ProcessCreated", PortStr = ""),
+    // Connections accepted by a service on this device. LocalPort is the service that answered.
+    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType =~ "InboundConnectionAccepted" | extend Direction = "Inbound connection", Channel = case(LocalPort == 3389, "RDP", LocalPort in (445, 139), "SMB", LocalPort == 135, "RPC", LocalPort in (5985, 5986), "WinRM", LocalPort == 22, "SSH", LocalPort == 5900, "VNC", strcat("Port ", LocalPort)), Remote = RemoteIP, Account = InitiatingProcessAccountName, Process = InitiatingProcessFileName, Result = ActionType, PortStr = tostring(LocalPort)),
+    // A new listening socket from something other than Windows itself. Backdoors and tunnels listen.
+    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType =~ "ListeningConnectionCreated" | where InitiatingProcessFileName !in~ (QuietListeners) | extend Direction = "Listening", Channel = strcat("Listener on ", LocalPort), Remote = "", Account = InitiatingProcessAccountName, Process = InitiatingProcessFileName, Result = InitiatingProcessCommandLine, PortStr = tostring(LocalPort)),
+    // Everything this device reached out to, browsers aside. Failures matter too — scanning fails a lot.
+    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("ConnectionSuccess","ConnectionFailed","ConnectionAttempt") | where InitiatingProcessFileName !in~ (Browsers) | where RemoteIPType !in ("Loopback","LinkLocal") | extend Direction = iff(RemoteIPType == "Public", "Outbound to internet", "Outbound internal"), Channel = case(RemotePort == 3389, "RDP", RemotePort in (445, 139), "SMB", RemotePort == 135, "RPC", RemotePort in (5985, 5986), "WinRM", RemotePort == 22, "SSH", RemotePort == 443, "HTTPS", RemotePort == 80, "HTTP", RemotePort == 53, "DNS", strcat("Port ", RemotePort)), Remote = iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), Account = InitiatingProcessAccountName, Process = InitiatingProcessFileName, Result = ActionType, PortStr = tostring(RemotePort)),
+    // Domain authentication from this device, as the domain controller saw it (Defender for Identity).
+    (IdentityLogonEvents | where TimeGenerated between (StartTime .. EndTime) | where isnotempty(DeviceCheck) and DeviceName contains DeviceCheck | extend Direction = "Outbound authentication", Channel = strcat(Protocol, " ", LogonType), RemoteIP = DestinationIPAddress, Remote = DestinationDeviceName, Account = iff(isnotempty(AccountUpn), AccountUpn, AccountName), Process = Application, Result = iff(isnotempty(FailureReason), strcat(ActionType, ": ", FailureReason), ActionType), PortStr = tostring(DestinationPort)),
+    // Domain authentication to this device from elsewhere.
+    (IdentityLogonEvents | where TimeGenerated between (StartTime .. EndTime) | where isnotempty(DeviceCheck) and DestinationDeviceName contains DeviceCheck | extend Direction = "Inbound authentication", Channel = strcat(Protocol, " ", LogonType), RemoteIP = IPAddress, Remote = DeviceName, Account = iff(isnotempty(AccountUpn), AccountUpn, AccountName), Process = Application, Result = iff(isnotempty(FailureReason), strcat(ActionType, ": ", FailureReason), ActionType), PortStr = tostring(DestinationPort))
+| where Account contains UserIdentityCheck
+| extend Window = case(TimeGenerated < IncidentStart, "1-Before", TimeGenerated <= IncidentEnd, "2-During", "3-After")
+| summarize Count = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Ports = make_set(PortStr, 10), Results = make_set(Result, 5) by Window, Direction, Channel, Remote, RemoteIP, Account, Process);
+// How many devices in the estate talk to each internet destination. One is this device alone.
+let Remotes = Rows | where Direction == "Outbound to internet" | distinct Remote;
+let Prevalence = DeviceNetworkEvents | where TimeGenerated > ago(PrevalenceWindow) | where RemoteIPType == "Public" | extend Remote = iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP) | where Remote in (Remotes) | summarize OrgDevices = dcount(DeviceId) by Remote;
+//
+Rows
+| join kind=leftouter IpToDevice on $left.RemoteIP == $right.IP
+| join kind=leftouter Prevalence on Remote
+| project Window, FirstSeen, LastSeen, Direction, Channel, Remote, RemoteIP, ResolvedDevice, Account, Process, Count, Ports, Results, OrgDevices
+| sort by FirstSeen asc
+//
+//| where Window == "1-Before"                         // how they got in — the connections that came first
+//| where Window == "3-After"                          // are they still connected?
+//| where Direction startswith "Inbound"               // who came in, from where
+//| where Direction == "Outbound to internet" and OrgDevices <= 2   // rare destinations — C2 lives here
+//| where Direction == "Listening"                     // something waiting for a connection
+//| summarize Hosts = make_set(Remote, 50) by Window, Direction, Channel  // the shape of it on one screen

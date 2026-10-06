@@ -1,0 +1,61 @@
+//Hands-on-keyboard triage query
+//
+// Is a person driving this device, and are they still on it? One row per device and account.
+let TimeToCheck = 7d;
+let DeviceCheck = "";
+let UserIdentityCheck = "";
+let ActiveWindow = 1h;
+//
+let Shells = dynamic(["cmd.exe","powershell.exe","pwsh.exe","powershell_ise.exe","wt.exe","bash.exe","wsl.exe"]);
+let DiscoveryBins = dynamic(["whoami.exe","systeminfo.exe","ipconfig.exe","nltest.exe","net.exe","net1.exe","netstat.exe","arp.exe","route.exe","tasklist.exe","quser.exe","qwinsta.exe","query.exe","hostname.exe","nslookup.exe","nbtstat.exe","dsquery.exe","setspn.exe","klist.exe","cmdkey.exe","wmic.exe","csvde.exe","ldifde.exe","netdom.exe","ping.exe","tracert.exe"]);
+let DiscoveryCmdlets = dynamic(["Get-ADUser","Get-ADComputer","Get-ADGroupMember","Get-ADDomain","Get-ADTrust","Get-NetUser","Get-DomainUser","Get-DomainComputer","Invoke-ShareFinder","Find-LocalAdminAccess","Get-NetSession","Get-SmbShare"]);
+let AttackToolPattern = @"(?i)(adfind|sharphound|bloodhound|rubeus|mimikatz|procdump|nanodump|psexec|paexec|netscan|advanced_ip_scanner|angryip|nmap|masscan|lazagne|seatbelt|winpeas|sharpup|powerview|certify|kerbrute)";
+let RmmPattern = @"(?i)(anydesk|screenconnect|connectwise|atera|splashtop|teamviewer|rustdesk|netsupport|client32|meshagent|syncro|action1|logmein|gotoassist|supremo|ultraviewer|dwagent|tightvnc|quickassist)";
+let TunnelPattern = @"(?i)(ngrok|cloudflared|chisel|plink|frpc|gost|ligolo)";
+let CredPattern = @"(?i)(comsvcs.*minidump|procdump.*lsass|sekurlsa|lsadump|invoke-mimikatz|kerberoast|rubeus|ntdsutil|ntds\.dit|reg(\.exe)?\s+save\s+hklm\\(sam|security|system)|vssadmin(\.exe)?\s+create\s+shadow|esentutl.*ntds)";
+let EvasionPattern = @"(?i)(wevtutil(\.exe)?\s+(cl|clear-log)|clear-eventlog|remove-eventlog|auditpol(\.exe)?\s+/clear|set-mppreference|add-mppreference|disablerealtimemonitoring|advfirewall\s+set\s+\w+\s+state\s+off|sc(\.exe)?\s+(stop|config)\s+windefend)";
+let RecoveryPattern = @"(?i)(vssadmin(\.exe)?\s+(delete\s+shadows|resize\s+shadowstorage)|shadowcopy\s+delete|wbadmin(\.exe)?\s+delete|recoveryenabled\s+no|bootstatuspolicy\s+ignoreallfailures|usn\s+deletejournal)";
+let NewAccountPattern = @"(?i)net1?(\.exe)?\s+(user|localgroup|group)\s+.*\s/add";
+let AdminPorts = dynamic([22,135,139,445,3389,5985,5986,5900]);
+// Processes that open LSASS legitimately all day. Extend with your own security tooling.
+let LsassReaders = dynamic(["MsMpEng.exe","MsSense.exe","SenseIR.exe","SenseNdr.exe","csrss.exe","wininit.exe","lsass.exe","services.exe","svchost.exe","WmiPrvSE.exe","taskmgr.exe"]);
+//
+union isfuzzy=true
+    // Recon typed into a shell. Agents run whoami too, but not from cmd.exe or powershell.exe.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where FileName in~ (DiscoveryBins) or ProcessCommandLine has_any (DiscoveryCmdlets) | where InitiatingProcessFileName in~ (Shells) | extend Indicator = "Discovery", Technique = "TA0007", Actor = AccountName, Evidence = strcat(InitiatingProcessFileName, " > ", ProcessCommandLine), SourceIP = ProcessRemoteSessionIP),
+    // Four or more different recon tools inside ten minutes. Scripts do not do this; people do.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where FileName in~ (DiscoveryBins) | where InitiatingProcessFileName in~ (Shells) | summarize FirstTime = min(TimeGenerated), Tools = dcount(FileName), Seen = make_set(FileName, 10), SourceIP = take_any(ProcessRemoteSessionIP) by DeviceId, DeviceName, Actor = AccountName, Slot = bin(TimeGenerated, 10m) | where Tools >= 4 | extend TimeGenerated = FirstTime, Indicator = "Discovery burst", Technique = "TA0007", Evidence = strcat(Tools, " recon tools in 10 minutes: ", strcat_array(Seen, ", "))),
+    // Known offensive and recon tooling, by file name or command line.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where FileName matches regex AttackToolPattern or ProcessCommandLine matches regex AttackToolPattern | extend Tool = tolower(extract(AttackToolPattern, 1, strcat(FileName, " ", ProcessCommandLine))) | extend Indicator = "Attack tool", Technique = case(Tool in ("mimikatz","procdump","nanodump","lazagne"), "T1003", Tool in ("rubeus","kerbrute"), "T1558", Tool in ("psexec","paexec"), "T1569.002", Tool == "certify", "T1649", "T1087"), Actor = AccountName, Evidence = strcat(Tool, ": ", ProcessCommandLine), SourceIP = ProcessRemoteSessionIP),
+    // Remote access tooling. Signed, legitimate, and how most human-operated intrusions keep a seat.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where FileName matches regex RmmPattern or ProcessCommandLine matches regex RmmPattern | extend Indicator = "Remote access tool", Technique = "T1219", Actor = AccountName, Evidence = strcat(FolderPath, " | ", ProcessCommandLine), SourceIP = ProcessRemoteSessionIP),
+    // Tunnels that put an inside port on the internet.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where FileName matches regex TunnelPattern or ProcessCommandLine matches regex TunnelPattern | extend Indicator = "Tunnel", Technique = "T1572", Actor = AccountName, Evidence = ProcessCommandLine, SourceIP = ProcessRemoteSessionIP),
+    // Shells and recon run inside an RDP session. ProcessRemoteSessionIP is where the keyboard is.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where IsProcessRemoteSession == true | where FileName in~ (Shells) or FileName in~ (DiscoveryBins) | extend Indicator = "Commands in RDP session", Technique = "T1021.001", Actor = AccountName, Evidence = strcat("from ", ProcessRemoteSessionDeviceName, " ", ProcessRemoteSessionIP, " | ", ProcessCommandLine), SourceIP = ProcessRemoteSessionIP),
+    // Credential theft from the command line: LSASS dumps, hive saves, NTDS, Kerberos abuse.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ProcessCommandLine has_any ("comsvcs","procdump","sekurlsa","lsadump","mimikatz","kerberoast","rubeus","ntdsutil","ntds","reg","vssadmin","esentutl") | where ProcessCommandLine matches regex CredPattern | extend Indicator = "Credential access", Technique = "T1003", Actor = AccountName, Evidence = ProcessCommandLine, SourceIP = ProcessRemoteSessionIP),
+    // LSASS opened by something that has no business opening it.
+    (DeviceEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where (ActionType in~ ("OpenProcessApiCall","ReadProcessMemoryApiCall") and FileName =~ "lsass.exe" and InitiatingProcessFileName !in~ (LsassReaders)) or ActionType startswith "AsrLsassCredentialTheft" | extend Indicator = "Credential access", Technique = "T1003.001", Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, " by ", InitiatingProcessFileName, " | ", InitiatingProcessCommandLine)),
+    // Logs cleared, Defender switched off or excluded, firewall dropped.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ProcessCommandLine matches regex EvasionPattern | extend Indicator = "Defence evasion", Technique = iff(ProcessCommandLine has_any ("wevtutil","eventlog","auditpol"), "T1070.001", "T1562.001"), Actor = AccountName, Evidence = ProcessCommandLine, SourceIP = ProcessRemoteSessionIP),
+    (DeviceEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType =~ "TamperingAttempt" | extend Indicator = "Defence evasion", Technique = "T1562.001", Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, " by ", InitiatingProcessFileName, " | ", InitiatingProcessCommandLine)),
+    // Shadow copies and backups removed. The step immediately before encryption.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ProcessCommandLine matches regex RecoveryPattern | extend Indicator = "Inhibit recovery", Technique = "T1490", Actor = AccountName, Evidence = ProcessCommandLine, SourceIP = ProcessRemoteSessionIP),
+    // Local accounts made or promoted, from the command line or as the sensor recorded it.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ProcessCommandLine matches regex NewAccountPattern | extend Indicator = "Account created or elevated", Technique = "T1136.001", Actor = AccountName, Evidence = ProcessCommandLine, SourceIP = ProcessRemoteSessionIP),
+    (DeviceEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType in~ ("UserAccountCreated","UserAccountAddedToLocalGroup") | extend Indicator = "Account created or elevated", Technique = iff(ActionType =~ "UserAccountCreated", "T1136.001", "T1098"), Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, ": ", AccountDomain, "\\", AccountName)),
+    // One process touching admin ports on five or more internal hosts in an hour: scanning or spreading.
+    (DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where RemoteIPType == "Private" and RemotePort in (AdminPorts) | where ActionType in~ ("ConnectionSuccess","ConnectionFailed","ConnectionAttempt") | summarize FirstTime = min(TimeGenerated), Targets = dcount(RemoteIP), Ports = make_set(RemotePort, 8) by DeviceId, DeviceName, Actor = InitiatingProcessAccountName, InitiatingProcessFileName, Slot = bin(TimeGenerated, 1h) | where Targets >= 5 | extend TimeGenerated = FirstTime, Indicator = "Admin-port fan-out", Technique = "T1046", Evidence = strcat(InitiatingProcessFileName, " reached ", Targets, " internal hosts on ports ", strcat_array(Ports, ",")))
+| where Actor contains UserIdentityCheck
+| summarize Indicators = make_set(Indicator, 15), Techniques = make_set(Technique, 20), Events = count(), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), SourceIPs = make_set_if(SourceIP, isnotempty(SourceIP), 10), Evidence = make_set(Evidence, 25) by DeviceName, Actor
+// 11 indicators, 25 at most.
+| extend HokScore = toint(set_has_element(Indicators, "Discovery burst")) * 3 + toint(set_has_element(Indicators, "Attack tool")) * 3 + toint(set_has_element(Indicators, "Credential access")) * 3 + toint(set_has_element(Indicators, "Inhibit recovery")) * 3 + toint(set_has_element(Indicators, "Commands in RDP session")) * 2 + toint(set_has_element(Indicators, "Remote access tool")) * 2 + toint(set_has_element(Indicators, "Tunnel")) * 2 + toint(set_has_element(Indicators, "Defence evasion")) * 2 + toint(set_has_element(Indicators, "Account created or elevated")) * 2 + toint(set_has_element(Indicators, "Admin-port fan-out")) * 2 + toint(set_has_element(Indicators, "Discovery"))
+| extend MinutesSinceLast = datetime_diff("minute", now(), LastSeen), ActiveNow = LastSeen >= ago(ActiveWindow)
+| project HokScore, ActiveNow, MinutesSinceLast, DeviceName, Actor, Indicators, Techniques, SourceIPs, FirstSeen, LastSeen, Events, Evidence
+| sort by HokScore desc, LastSeen desc
+//
+//| where ActiveNow                                   // still at the keyboard — contain before you investigate
+//| where HokScore >= 6                               // strong hits only
+//| where Actor !in~ ("system","local service","network service")  // human accounts only; attackers often run as SYSTEM, so check both
+//| summarize Score = max(HokScore), Accounts = make_set(Actor, 10), Last = max(LastSeen) by DeviceName  // one line per device

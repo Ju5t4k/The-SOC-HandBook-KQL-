@@ -1,0 +1,59 @@
+//Hands-on-keyboard IOC harvest query
+//
+// Every indicator from the incident window in one table: what Defender's alerts already named,
+// plus the rare hashes, addresses, domains, URLs, accounts, persistence names and command lines
+// found on the device. This is the list for the ticket, for blocking, and for hok-scope.kql.
+let IncidentStart = ago(1d);              // first known attacker activity, e.g. datetime(2026-10-05T14:32:00Z)
+let IncidentEnd = now();
+let LookBefore = 1d;
+let LookAfter = 1d;
+let DeviceCheck = "";                     // fill in at least one of these two
+let UserIdentityCheck = "";
+let PrevalenceWindow = 30d;
+let RareThreshold = 3;                    // on this many devices or fewer across the estate counts as rare
+//
+let StartTime = IncidentStart - LookBefore;
+let EndTime = IncidentEnd + LookAfter;
+let Browsers = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe","opera.exe","iexplore.exe","msedgewebview2.exe"]);
+let SystemPaths = @"(?i)^[a-z]:\\(windows\\(system32|syswow64|winsxs|servicing|softwaredistribution)\\|program files( \(x86\))?\\(windows defender|microsoft))";
+let ToolTypes = @"(?i)\.(exe|dll|sys|ps1|bat|cmd|vbs|js|hta|msi|jar|py)$";
+let ToolPattern = @"(?i)(adfind|sharphound|bloodhound|rubeus|mimikatz|procdump|nanodump|psexec|paexec|netscan|advanced_ip_scanner|angryip|nmap|masscan|lazagne|seatbelt|winpeas|sharpup|powerview|certify|kerbrute|anydesk|screenconnect|atera|splashtop|rustdesk|netsupport|client32|meshagent|ngrok|cloudflared|chisel|plink|rclone|megasync|winscp|filezilla|pscp)";
+let SuspectCmdPattern = @"(?i)(comsvcs.*minidump|procdump.*lsass|sekurlsa|lsadump|mimikatz|kerberoast|ntdsutil|reg(\.exe)?\s+save\s+hklm|wevtutil(\.exe)?\s+cl|clear-eventlog|set-mppreference|add-mppreference|vssadmin(\.exe)?\s+delete|wbadmin(\.exe)?\s+delete|recoveryenabled\s+no|net1?(\.exe)?\s+(user|localgroup|group)\s+.*\s/add|psexec|wmic(\.exe)?\s+/node:|invoke-command\s.*-computername|rclone|-encodedcommand|\s-enc\s|frombase64string|downloadstring|-urlcache|/transfer\s)";
+//
+// Alerts that involved this device or this account in the window.
+let AlertIds = AlertEvidence | where TimeGenerated between (StartTime .. EndTime) | where (isnotempty(DeviceCheck) and EntityType =~ "Machine" and DeviceName contains DeviceCheck) or (isnotempty(UserIdentityCheck) and EntityType =~ "User" and (AccountName contains UserIdentityCheck or AccountUpn contains UserIdentityCheck)) | distinct AlertId;
+// Files run or written on the device outside the Windows and Defender folders.
+let Files = materialize(union isfuzzy=true
+    (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck and AccountName contains UserIdentityCheck | where isnotempty(SHA256) | where not(FolderPath matches regex SystemPaths) or FileName matches regex ToolPattern | project TimeGenerated, DeviceName, SHA256, FileName, FolderPath, How = "executed"),
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck and InitiatingProcessAccountName contains UserIdentityCheck | where ActionType in~ ("FileCreated","FileRenamed") | where isnotempty(SHA256) and FileName matches regex ToolTypes | where not(FolderPath matches regex SystemPaths) | project TimeGenerated, DeviceName, SHA256, FileName, FolderPath, How = "written"));
+let FilePrevalence = union isfuzzy=true (DeviceProcessEvents | where TimeGenerated > ago(PrevalenceWindow) | where SHA256 in ((Files | distinct SHA256)) | project SHA256, DeviceId), (DeviceFileEvents | where TimeGenerated > ago(PrevalenceWindow) | where SHA256 in ((Files | distinct SHA256)) | project SHA256, DeviceId) | summarize OrgDevices = dcount(DeviceId) by SHA256;
+// Internet destinations reached by something other than a browser.
+let Remotes = materialize(DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck and InitiatingProcessAccountName contains UserIdentityCheck | where RemoteIPType == "Public" and ActionType =~ "ConnectionSuccess" | where InitiatingProcessFileName !in~ (Browsers) | extend Remote = iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP) | summarize TimeGenerated = min(TimeGenerated), Processes = make_set(InitiatingProcessFileName, 3), IPs = make_set(RemoteIP, 3) by DeviceName, Remote);
+let RemotePrevalence = DeviceNetworkEvents | where TimeGenerated > ago(PrevalenceWindow) | where RemoteIPType == "Public" | extend Remote = iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP) | where Remote in ((Remotes | distinct Remote)) | summarize OrgDevices = dcount(DeviceId) by Remote;
+//
+union isfuzzy=true
+    // What Defender's own alerts named. Each evidence row can carry several indicator types.
+    (AlertEvidence | where TimeGenerated between (StartTime .. EndTime) | where AlertId in (AlertIds) | extend Pairs = pack_array(bag_pack("t", "SHA256", "v", SHA256), bag_pack("t", "SHA1", "v", SHA1), bag_pack("t", "IP", "v", RemoteIP), bag_pack("t", "URL", "v", RemoteUrl), bag_pack("t", "Account", "v", iff(isnotempty(AccountUpn), AccountUpn, AccountName)), bag_pack("t", "Command line", "v", ProcessCommandLine), bag_pack("t", "Registry", "v", RegistryKey), bag_pack("t", "File name", "v", FileName)) | mv-expand P = Pairs | extend IndicatorType = tostring(P.t), Indicator = tostring(P.v) | where isnotempty(Indicator) | project TimeGenerated, DeviceName, IndicatorType, Indicator, Context = strcat(Title, " | ", AttackTechniques), Source = "Alert", OrgDevices = long(null)),
+    // Rare files. A hash on three devices or fewer, run or dropped during the incident.
+    (Files | join kind=leftouter FilePrevalence on SHA256 | where isnull(OrgDevices) or OrgDevices <= RareThreshold or FileName matches regex ToolPattern | project TimeGenerated, DeviceName, IndicatorType = "SHA256", Indicator = SHA256, Context = strcat(How, " ", FolderPath), Source = "Device", OrgDevices),
+    (Files | where FileName matches regex ToolPattern | project TimeGenerated, DeviceName, IndicatorType = "File name", Indicator = FileName, Context = strcat(How, " ", FolderPath), Source = "Device", OrgDevices = long(null)),
+    // Rare destinations. Somewhere almost nothing else in the estate talks to.
+    (Remotes | join kind=leftouter RemotePrevalence on Remote | where isnull(OrgDevices) or OrgDevices <= RareThreshold | project TimeGenerated, DeviceName, IndicatorType = iff(isnotnull(parse_ipv4(Remote)) or Remote contains ":", "IP", "Domain"), Indicator = Remote, Context = strcat("contacted by ", strcat_array(Processes, ", "), " | ", strcat_array(IPs, ", ")), Source = "Device", OrgDevices),
+    // Where downloaded files came from, whatever downloaded them.
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck and InitiatingProcessAccountName contains UserIdentityCheck | where isnotempty(FileOriginUrl) | project TimeGenerated, DeviceName, IndicatorType = "URL", Indicator = FileOriginUrl, Context = strcat(FileName, " by ", InitiatingProcessFileName, iff(isnotempty(FileOriginReferrerUrl), strcat(" | from page ", FileOriginReferrerUrl), "")), Source = "Device", OrgDevices = long(null)),
+    // Accounts that logged on remotely, and the addresses they came from.
+    (DeviceLogonEvents | where TimeGenerated between (StartTime .. EndTime) | where isnotempty(DeviceCheck) and DeviceName contains DeviceCheck | where ActionType =~ "LogonSuccess" and LogonType in~ ("RemoteInteractive","Network","NetworkCleartext","NewCredentials") | where AccountName contains UserIdentityCheck | extend Pairs = pack_array(bag_pack("t", "Account", "v", strcat(AccountDomain, "\\", AccountName)), bag_pack("t", "IP (logon source)", "v", RemoteIP)) | mv-expand P = Pairs | extend IndicatorType = tostring(P.t), Indicator = tostring(P.v) | where isnotempty(Indicator) and Indicator !in ("-","\\","127.0.0.1","::1") | project TimeGenerated, DeviceName, IndicatorType, Indicator, Context = strcat(LogonType, " logon"), Source = "Device", OrgDevices = long(null)),
+    // Accounts created or promoted on the device.
+    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("UserAccountCreated","UserAccountAddedToLocalGroup") | project TimeGenerated, DeviceName, IndicatorType = "Account (created or promoted)", Indicator = strcat(AccountDomain, "\\", AccountName), Context = strcat(ActionType, " by ", InitiatingProcessAccountName), Source = "Device", OrgDevices = long(null)),
+    // Services and scheduled tasks installed. Names are reused across an intrusion, so they make good sweep terms.
+    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType =~ "ServiceInstalled" or ActionType startswith "ScheduledTask" | extend AF = todynamic(AdditionalFields) | extend Name = case(isnotempty(tostring(AF.ServiceName)), tostring(AF.ServiceName), isnotempty(tostring(AF.TaskName)), tostring(AF.TaskName), FileName) | project TimeGenerated, DeviceName, IndicatorType = iff(ActionType =~ "ServiceInstalled", "Service", "Scheduled task"), Indicator = Name, Context = strcat(ActionType, " | ", FolderPath, " ", FileName), Source = "Device", OrgDevices = long(null)),
+    // Autorun registry values pointing somewhere unusual.
+    (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType =~ "RegistryValueSet" | where RegistryKey has_any (@"CurrentVersion\Run", @"Policies\Explorer\Run", "Winlogon", "Image File Execution Options") | where not(trim(@"[\x22 ]+", RegistryValueData) matches regex SystemPaths) | project TimeGenerated, DeviceName, IndicatorType = "Registry", Indicator = strcat(RegistryKey, "\\", RegistryValueName), Context = RegistryValueData, Source = "Device", OrgDevices = long(null)),
+    // The command lines that did the damage. These are behaviours (IOAs) as much as indicators.
+    (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck and AccountName contains UserIdentityCheck | where ProcessCommandLine matches regex SuspectCmdPattern | project TimeGenerated, DeviceName, IndicatorType = "Command line", Indicator = ProcessCommandLine, Context = strcat(InitiatingProcessFileName, " > ", FileName), Source = "Device", OrgDevices = long(null))
+| summarize FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Devices = make_set(DeviceName, 10), OrgDevices = max(OrgDevices), Context = make_set(Context, 5), Sources = make_set(Source, 2) by IndicatorType, Indicator
+| sort by IndicatorType asc, FirstSeen asc
+//
+//| where IndicatorType in ("SHA256","IP","Domain","URL")     // what you can block
+//| where Sources has "Device" and Sources !has "Alert"       // what you found that Defender did not alert on
+//| extend Defanged = iff(IndicatorType in ("IP","Domain","URL","IP (logon source)"), replace_string(replace_string(Indicator, ".", "[.]"), "http", "hxxp"), Indicator)  // safe to paste into a ticket or chat

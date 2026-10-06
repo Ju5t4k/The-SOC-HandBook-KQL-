@@ -1,0 +1,44 @@
+//Hands-on-keyboard scope query
+//
+// Who else. Give it any indicator from hok-iocs.kql and it sweeps the estate for it.
+// Fill in one or more; blank ones are skipped.
+let TimeToCheck = 30d;
+let HashCheck = "";                       // SHA256 or SHA1
+let IPCheck = "";
+let DomainCheck = "";
+let AccountCheck = "";                    // sAMAccountName or UPN
+let CommandCheck = "";
+let FileNameCheck = "";
+let ServiceOrTaskCheck = "";
+//
+// Context: what each device is, so a silent unhealthy sensor is not mistaken for a clean one.
+// Renamed because the identity and cloud tables carry their own OSPlatform, DeviceType and MachineGroup.
+let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, DeviceOS = OSPlatform, DeviceKind = DeviceType, DeviceGroup = MachineGroup, OnboardingStatus, SensorHealthState;
+//
+union isfuzzy=true
+    // The file, on disk or running.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(HashCheck) and (SHA256 =~ HashCheck or SHA1 =~ HashCheck) | extend Hit = "File", Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, " ", FolderPath, " by ", InitiatingProcessFileName)),
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(HashCheck) and (SHA256 =~ HashCheck or SHA1 =~ HashCheck) | extend Hit = "Execution", Actor = AccountName, Evidence = ProcessCommandLine),
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(FileNameCheck) and FileName =~ FileNameCheck | extend Hit = "File name", Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, " ", FolderPath, " | SHA256=", SHA256)),
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(FileNameCheck) and FileName =~ FileNameCheck | extend Hit = "File name executed", Actor = AccountName, Evidence = strcat(FolderPath, " | SHA256=", SHA256, " | ", ProcessCommandLine)),
+    // The address or domain, from the endpoint, the domain controller and the cloud.
+    (DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(IPCheck) and RemoteIP == IPCheck) or (isnotempty(DomainCheck) and RemoteUrl contains DomainCheck) | extend Hit = "Network", Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, " ", InitiatingProcessFileName, " -> ", iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), ":", RemotePort)),
+    (DeviceLogonEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(IPCheck) and RemoteIP == IPCheck | extend Hit = "Logon from IP", Actor = AccountName, Evidence = strcat(ActionType, " ", LogonType, " logon")),
+    (IdentityLogonEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(IPCheck) and IPAddress == IPCheck | extend Hit = "Domain auth from IP", DeviceId = "", Actor = iff(isnotempty(AccountUpn), AccountUpn, AccountName), Evidence = strcat(ActionType, " ", Protocol, " to ", DestinationDeviceName)),
+    (CloudAppEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(IPCheck) and IPAddress == IPCheck | extend Hit = "Cloud activity from IP", DeviceName = "", DeviceId = "", Actor = iff(isnotempty(tostring(RawEventData.UserId)), tostring(RawEventData.UserId), AccountDisplayName), Evidence = strcat(Application, " | ", ActionType, " | ", ObjectName)),
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(DomainCheck) and FileOriginUrl contains DomainCheck | extend Hit = "Downloaded from", Actor = InitiatingProcessAccountName, Evidence = strcat(FileName, " | ", FileOriginUrl)),
+    (EmailUrlInfo | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(DomainCheck) and UrlDomain contains DomainCheck | join kind=inner (EmailEvents | where TimeGenerated >= ago(TimeToCheck) | project NetworkMessageId, RecipientEmailAddress, SenderFromAddress, Subject, DeliveryAction) on NetworkMessageId | extend Hit = "Mail delivery", DeviceName = "", DeviceId = "", Actor = RecipientEmailAddress, Evidence = strcat(DeliveryAction, " | from ", SenderFromAddress, " | ", Subject, " | ", Url)),
+    // The account, wherever it logged on or authenticated.
+    (DeviceLogonEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(AccountCheck) and AccountName contains AccountCheck | where ActionType =~ "LogonSuccess" | extend Hit = "Account logon", Actor = AccountName, Evidence = strcat(LogonType, " from ", RemoteDeviceName, " ", RemoteIP)),
+    (IdentityLogonEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(AccountCheck) and (AccountName contains AccountCheck or AccountUpn contains AccountCheck) | extend Hit = "Account domain auth", DeviceId = "", Actor = iff(isnotempty(AccountUpn), AccountUpn, AccountName), Evidence = strcat(ActionType, " ", Protocol, " from ", DeviceName, " ", IPAddress, " to ", DestinationDeviceName)),
+    // The command, and the persistence name.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(CommandCheck) and ProcessCommandLine contains CommandCheck | extend Hit = "Command", Actor = AccountName, Evidence = ProcessCommandLine),
+    (DeviceEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(ServiceOrTaskCheck) | where ActionType =~ "ServiceInstalled" or ActionType startswith "ScheduledTask" | where tostring(AdditionalFields) contains ServiceOrTaskCheck or FileName contains ServiceOrTaskCheck | extend Hit = "Service or task", Actor = InitiatingProcessAccountName, Evidence = strcat(ActionType, " | ", FolderPath, " ", FileName))
+| join kind=leftouter Machines on $left.DeviceId == $right.MiDeviceId
+| project-rename EventTime = TimeGenerated
+| project EventTime, Hit, DeviceName, Actor, Evidence, DeviceOS, DeviceKind, DeviceGroup, OnboardingStatus, SensorHealthState, DeviceId
+| sort by EventTime asc
+//
+//| summarize Hits = make_set(Hit, 10), First = min(EventTime), Last = max(EventTime) by DeviceName, Actor  // one line per device — this is the scope list
+//| summarize Devices = dcount(DeviceName), Accounts = dcount(Actor) by bin(EventTime, 1d)  // the campaign day by day
+//| where SensorHealthState != "Active"                    // devices whose silence proves nothing

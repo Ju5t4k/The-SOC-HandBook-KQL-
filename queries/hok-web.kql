@@ -1,0 +1,53 @@
+//Hands-on-keyboard web activity query
+//
+// Where the browser went, what was downloaded and from which page, what tools pulled
+// down from the command line, and what SmartScreen or network protection said about it.
+let IncidentStart = ago(1d);              // first known attacker activity, e.g. datetime(2026-10-05T14:32:00Z)
+let IncidentEnd = now();
+let LookBefore = 7d;
+let LookAfter = 1d;
+let DeviceCheck = "";
+let UserIdentityCheck = "";               // matches the device account name and the Safe Links UPN, so a partial name works for both
+let UrlCheck = "";
+let PrevalenceWindow = 30d;
+//
+let StartTime = IncidentStart - LookBefore;
+let EndTime = IncidentEnd + LookAfter;
+let Browsers = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe","opera.exe","iexplore.exe","msedgewebview2.exe"]);
+let Fetchers = dynamic(["powershell.exe","pwsh.exe","cmd.exe","curl.exe","wget.exe","certutil.exe","bitsadmin.exe","mshta.exe","rundll32.exe","regsvr32.exe","msiexec.exe","wscript.exe","cscript.exe","python.exe","finger.exe","ftp.exe","tftp.exe"]);
+let DownloadPattern = @"(?i)(certutil(\.exe)?\s.*-urlcache|bitsadmin(\.exe)?\s.*/transfer|start-bitstransfer|invoke-webrequest|invoke-restmethod|\biwr\s|\birm\s|downloadstring|downloadfile|net\.webclient|curl(\.exe)?\s.*(-o|--output)\s|wget(\.exe)?\s)";
+let HostOf = (Url: string) { extract(@"^(?:[a-zA-Z][a-zA-Z0-9+.-]*://)?([^/:?#\s]+)", 1, Url) };
+//
+let Rows = materialize(union isfuzzy=true
+    // Browsing, one row per site per hour. RemoteUrl is the host the browser connected to.
+    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where InitiatingProcessFileName in~ (Browsers) | where isnotempty(RemoteUrl) and ActionType =~ "ConnectionSuccess" | summarize TimeGenerated = min(TimeGenerated), Count = count() by DeviceName, Actor = InitiatingProcessAccountName, Process = InitiatingProcessFileName, Domain = tolower(HostOf(RemoteUrl)), Slot = bin(TimeGenerated, 1h) | extend Activity = "Browsing", Url = Domain, Referrer = "", FileName = "", SHA256 = "", Detail = strcat(Count, " connections")),
+    // A link opened in the browser from another program — mail, chat, a document.
+    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType =~ "BrowserLaunchedToOpenUrl" | where isnotempty(RemoteUrl) | extend Activity = "Link opened from an app", Actor = InitiatingProcessAccountName, Process = InitiatingProcessFileName, Url = RemoteUrl, Domain = tolower(HostOf(RemoteUrl)), Referrer = "", FileName = "", SHA256 = "", Count = tolong(1), Detail = strcat("opened by ", InitiatingProcessFileName)),
+    // A file saved by the browser. FileOriginReferrerUrl is the page that linked to it.
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where isnotempty(FileOriginUrl) | where InitiatingProcessFileName in~ (Browsers) | extend Activity = "Download (browser)", Actor = InitiatingProcessAccountName, Process = InitiatingProcessFileName, Url = FileOriginUrl, Domain = tolower(HostOf(FileOriginUrl)), Referrer = FileOriginReferrerUrl, Count = tolong(1), Detail = strcat(FolderPath, " | ", FileSize, " bytes")),
+    // A file written by a command-line tool. This is how operators bring their kit in.
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where InitiatingProcessFileName in~ (Fetchers) | where ActionType in~ ("FileCreated","FileRenamed") | where isnotempty(FileOriginUrl) or FileName matches regex @"(?i)\.(exe|dll|ps1|bat|cmd|vbs|js|hta|msi|zip|7z|rar|iso|lnk)$" | extend Activity = "Download (tool)", Actor = InitiatingProcessAccountName, Process = InitiatingProcessFileName, Url = FileOriginUrl, Domain = tolower(HostOf(FileOriginUrl)), Referrer = FileOriginReferrerUrl, Count = tolong(1), Detail = strcat(FolderPath, " | ", InitiatingProcessCommandLine)),
+    // The download command itself, with the URL pulled out of it.
+    (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ProcessCommandLine matches regex DownloadPattern | extend Url = extract(@"(?i)(https?://[^\s\x22\x27<>|)]+)", 1, ProcessCommandLine) | extend Activity = "Download command", Actor = AccountName, Process = FileName, Domain = tolower(HostOf(Url)), Referrer = "", FileName = "", SHA256 = "", Count = tolong(1), Detail = ProcessCommandLine),
+    // What SmartScreen warned about, and network protection blocked or audited.
+    (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType startswith "SmartScreen" or ActionType startswith "ExploitGuardNetworkProtection" | extend Activity = iff(ActionType startswith "SmartScreen", "SmartScreen", "Network protection"), Actor = InitiatingProcessAccountName, Process = InitiatingProcessFileName, Url = RemoteUrl, Domain = tolower(HostOf(RemoteUrl)), Referrer = "", Count = tolong(1), Detail = strcat(ActionType, " | ", tostring(todynamic(AdditionalFields).Experience), tostring(todynamic(AdditionalFields).ResponseCategory), " | ", FileName)),
+    // Links clicked in mail, Teams or Office, and whether Safe Links let them through.
+    (UrlClickEvents | where TimeGenerated between (StartTime .. EndTime) | where isnotempty(UserIdentityCheck) | where AccountUpn contains UserIdentityCheck | extend Activity = "Safe Links click", DeviceName = "", Actor = AccountUpn, Process = Workload, Domain = tolower(HostOf(Url)), Referrer = "", FileName = "", SHA256 = "", Count = tolong(1), Detail = strcat(ActionType, " | verdict=", ThreatTypes, iff(IsClickedThrough, " | clicked through the warning", "")))
+| where Actor contains UserIdentityCheck
+| where Url contains UrlCheck or Domain contains UrlCheck
+| extend Window = case(TimeGenerated < IncidentStart, "1-Before", TimeGenerated <= IncidentEnd, "2-During", "3-After"));
+// How many devices in the estate have reached each domain. A domain only this device visits is worth reading.
+let Domains = Rows | where isnotempty(Domain) | summarize make_set(Domain, 5000);
+let Prevalence = DeviceNetworkEvents | where TimeGenerated > ago(PrevalenceWindow) | where isnotempty(RemoteUrl) | where RemoteUrl has_any (toscalar(Domains)) | extend Domain = tolower(HostOf(RemoteUrl)) | summarize OrgDevices = dcount(DeviceId) by Domain;
+//
+Rows
+| join kind=leftouter Prevalence on Domain
+| project-rename EventTime = TimeGenerated
+| project EventTime, Window, Activity, DeviceName, Actor, Process, Domain, OrgDevices, Url, Referrer, FileName, SHA256, Count, Detail
+| sort by EventTime asc
+//
+//| where Activity startswith "Download"                    // everything that arrived on disk from the web
+//| where Activity != "Browsing"                            // drop the noise, keep the events
+//| where OrgDevices <= 2                                   // sites almost nobody else in the estate visits
+//| where Activity == "SmartScreen" and Detail has "Override"  // the user clicked past the warning
+//| summarize Hours = dcount(bin(EventTime, 1h)), Devices = take_any(OrgDevices) by Domain, Window  // one row per site
