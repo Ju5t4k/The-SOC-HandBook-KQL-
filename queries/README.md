@@ -28,7 +28,8 @@
 | [`hok-web.kql`](hok-web.kql) | `Device*`, `UrlClickEvents` | Browsing, downloads with the page that linked them, command-line downloads, SmartScreen, network protection, Safe Links |
 | [`hok-lateral.kql`](hok-lateral.kql) | `Device*`, `Identity*` | Hops out of the device seen from both ends and from the domain controller, plus everywhere the account logged on |
 | [`hok-files.kql`](hok-files.kql) | `DeviceFileEvents`, `DeviceEvents`, `CloudAppEvents` | Files opened, dropped, archived, changed over SMB, deleted, renamed, labelled, copied to removable media, pulled from SharePoint |
-| [`hok-exfil.kql`](hok-exfil.kql) | `Device*`, `CloudAppEvents`, `EmailEvents` | Transfer tools, tunnels, storage services, sustained connections, removable media, cloud downloads and sharing, mail out |
+| [`hok-persistence.kql`](hok-persistence.kql) | `Device*` | What an operator leaves to come back: accounts, services, tasks, autoruns, logon-screen backdoors, RDP and WinRM switched on, remote tools, WMI subscriptions, LSA packages, web shells, SSH keys |
+| [`hok-exfil.kql`](hok-exfil.kql) | `Device*`, `CloudAppEvents`, `EmailEvents` | What moved away from the device and where it went: to another machine over SMB, to the RDP client, to USB, and to the internet by tool, browser, file protocol, DNS or sustained connection — with volume where file sizes exist |
 | [`hok-iocs.kql`](hok-iocs.kql) | `AlertEvidence`, `Device*` | Every indicator from the window in one table — alert evidence plus rare hashes, destinations, URLs, accounts, persistence names and command lines |
 | [`hok-scope.kql`](hok-scope.kql) | `Device*`, `Identity*`, `CloudAppEvents`, `Email*` | Any indicator from `hok-iocs.kql`, swept across the estate |
 | [`hok-enrich-ah.kql`](hok-enrich-ah.kql) | Advanced Hunting only | `FileProfile()` on every file the device ran or wrote: global prevalence, first seen, signer |

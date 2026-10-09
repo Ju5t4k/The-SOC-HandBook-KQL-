@@ -30,7 +30,7 @@ union
 //
 // Other Advanced Hunting functions that save time on this kind of incident:
 //   DeviceFromIP()          which device held an internal address at a given moment
-//     DeviceLogonEvents | where Timestamp > ago(1d) | where DeviceName contains DeviceCheck | where RemoteIPType == "Private" | distinct IP = RemoteIP | invoke DeviceFromIP()
+//     DeviceLogonEvents | where Timestamp > ago(1d) | where DeviceName contains DeviceCheck | where RemoteIPType == "Private" | project IP = RemoteIP | distinct IP | invoke DeviceFromIP()
 //   AssignedIPAddresses()   which addresses this device held at a given moment
 //     AssignedIPAddresses("<device>", datetime(2026-10-05T14:32:00Z))
 //   SeenBy()                which onboarded devices have seen an unmanaged device on the network

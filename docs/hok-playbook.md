@@ -16,9 +16,9 @@ is the whole method on one screen and the queries stand on their own.
 | [`hok-connections.kql`](../queries/hok-connections.kql) | 3 | What connected in and out — before, during and after? |
 | [`hok-web.kql`](../queries/hok-web.kql) | 4 | Where did the browser go, and what was downloaded from where? |
 | [`hok-lateral.kql`](../queries/hok-lateral.kql) | 5 | Where did they go next, and where has the account been? |
-| [`clickfix-persistence.kql`](../queries/clickfix-persistence.kql) | 6 | What did they leave behind? (Generic despite the name.) |
+| [`hok-persistence.kql`](../queries/hok-persistence.kql) | 6 | What did they leave so they can come back? |
 | [`hok-files.kql`](../queries/hok-files.kql) | 7 | What did they open, drop, pack, change and delete? |
-| [`hok-exfil.kql`](../queries/hok-exfil.kql) | 8 | Did data leave, and by which channel? |
+| [`hok-exfil.kql`](../queries/hok-exfil.kql) | 8 | What moved away from the device, and where did it go? |
 | [`hok-iocs.kql`](../queries/hok-iocs.kql) | 9 | Every indicator from the window, in one table |
 | [`hok-enrich-ah.kql`](../queries/hok-enrich-ah.kql) | 9 | Global prevalence and signer for every file (Advanced Hunting only) |
 | [`hok-scope.kql`](../queries/hok-scope.kql) | 10 | Who else has any of these indicators? |
@@ -148,9 +148,9 @@ The whole method on one screen.
 | 3 | What connected in and out, before, during and after? | `hok-connections.kql` | 30 min |
 | 4 | What did the browser do, and what came down from the web? | `hok-web.kql` | 20 min |
 | 5 | Where did they go next? | `hok-lateral.kql` | 30 min per hop |
-| 6 | What did they leave behind? | `clickfix-persistence.kql`, Live Response | 15 min |
+| 6 | What did they leave behind? | `hok-persistence.kql`, Live Response | 15 min |
 | 7 | Which files did they touch? | `hok-files.kql` | 30 min |
-| 8 | Did data leave? | `hok-exfil.kql` | 30 min |
+| 8 | What moved away from the device, and where to? | `hok-exfil.kql` | 30 min |
 | 9 | What are the IOCs and IOAs? | `hok-iocs.kql`, `hok-enrich-ah.kql` | 20 min |
 | 10 | Who else? | `hok-scope.kql` | 20 min |
 | 11 | Why did it happen, and what changes? | The RCA template | 60 min |
@@ -385,10 +385,30 @@ Patterns worth naming in the ticket:
 
 ### Phase 6 — What did they leave behind? · 15 minutes
 
-Run **[`clickfix-persistence.kql`](../queries/clickfix-persistence.kql)** with
-`DeviceCheck`. Despite the name it looks for persistence generally — run keys,
-services, tasks, startup items, COM and shell hijacks, browser extensions — and
-works for any intrusion.
+Run **`hok-persistence.kql`** with `DeviceCheck` and the window set. It looks
+for what an operator leaves so they can come back — which is mostly not malware:
+
+```
+Account                 local accounts created or added to a group
+Service                 services created, as the sensor saw them and as they were typed
+Scheduled task          tasks created, the same two ways
+Autorun                 run keys, Winlogon values, the Startup folder
+Logon-screen backdoor   a debugger on sethc, utilman and the like, or the binary replaced
+Remote access enabled   RDP allowed, network-level authentication off, RDP or WinRM opened up
+Remote access tool      a remote support tool installed as a service or into Program Files
+WMI subscription        code bound to a WMI event — nothing on disk to find
+LSA package             a DLL loaded into LSASS that sees every password
+Netsh helper            a DLL loaded whenever netsh runs
+COM hijack              a user-hive CLSID pointed at the operator's code
+Browser extension       an extension forced on through policy
+Web shell               script files written into a web root
+SSH key                 an authorized_keys file planted or changed
+```
+
+Five of these need no malware at all to get back in: `Account`,
+`Logon-screen backdoor`, `Remote access enabled`, `Web shell` and `SSH key`. They
+are the ones a clean-up that only removes files and tools will miss, and they
+are filtered together at the foot of the query.
 
 Telemetry tells you what was *created*. Live Response `persistence` and the
 investigation package's `Autoruns` tell you what is *there now*. Use both;
@@ -396,8 +416,8 @@ something created before your retention window will only show in the second.
 
 Add to the register:
 
-- Accounts from the timeline's `06-Persistence` rows
-- Remote access tools — installed as services, they are persistence too
+- Every account from the `Account` rows
+- Every remote access tool — it is persistence and a way in at the same time
 - Any cloud identity changes: if a domain or Entra account was touched, run
   [`auditlogs.kql`](../queries/auditlogs.kql) and the device code
   [persistence query](../queries/devicecode-persistence.kql) for MFA methods,
@@ -438,37 +458,74 @@ How to read it:
 share without copying them leaves a logon and nothing else. Say so in the ticket
 rather than letting an empty result imply nothing was accessed.
 
-### Phase 8 — Data exfiltration · 30 minutes
+### Phase 8 — What moved away from the device? · 30 minutes
 
-Set `InternalDomains` first — it ships as `contoso.com`, and without it every
-outbound mail looks external. Then run **`hok-exfil.kql`**.
+Run **`hok-exfil.kql`** with `DeviceCheck` set. Every row is something leaving
+the device, and `Destination` says where it went. Add `UserIdentityCheck` to
+include the account's own channels as well — and set `InternalDomains` first,
+because it ships as `contoso.com` and without it every outbound mail looks
+external.
 
-| Channel | Looks like |
+Data can leave a device four ways. Read them in this order, because the first
+three are steps operators take before the fourth.
+
+**To another machine on the network** — staging, usually on a server, before it
+leaves the estate:
+
+| Movement | Looks like |
+|---|---|
+| `Copied to another device` | Files landing on another machine over SMB from this one, seen at the far end. `Volume` gives files and bytes. |
+| `Copy command to a share` | `robocopy`, `xcopy`, `Copy-Item` naming a share. The share can be the source — read `Evidence`. |
+| `Copied to RDP client` | Files written to `\\tsclient\` — the drive of the machine the RDP session came from. The operator's own computer. |
+
+**To removable media:**
+
+| Movement | Looks like |
+|---|---|
+| `Copied to USB` | Files written to a drive letter that was USB storage in the window, with `Volume` |
+| `Removable media (device control)` | Storage connected, and what device control audited or blocked |
+
+**To the internet:**
+
+| Movement | Looks like |
 |---|---|
 | `Transfer tool` | rclone, MEGA, WinSCP, cloud CLIs, `curl -T`, PowerShell uploads. `Destination` holds the URL or the rclone remote name. |
 | `Transfer tool config` | `rclone.conf` written — it names the remote account |
+| `Archive picked up` | An archive built on the device, then named on a later command line. The hand-off from staging to sending, with the archive's size. |
 | `Tunnel` | ngrok, cloudflared, reverse SSH |
-| `Storage service (non-browser)` | MEGA, Dropbox, file-drop sites, Telegram, Discord reached by something other than a browser |
-| `Sustained connection` | 50 or more connections in an hour from one process to one public destination |
-| `Staged archive` | Archives written — what the exfil would have carried |
-| `Removable media` | Storage plugged in, and device control's record of it |
-| `Cloud bulk download` | 20 or more SharePoint or OneDrive downloads in an hour by the account |
-| `Cloud sharing` | Anonymous links and external sharing created |
-| `Mail out` | Attachments mailed to outside addresses |
+| `Storage service (program)` | MEGA, Dropbox, file-drop sites, Telegram, Discord reached by something other than a browser |
+| `Storage service (browser)` | The same sites in a browser. Uploading by hand looks exactly like this. |
+| `File-transfer protocol to the internet` | FTP, SFTP/SCP, SMB, NFS, rsync, or SMTP from something that is not a mail client |
+| `DNS from a non-resolver` | Twenty or more DNS connections an hour to an outside server from something other than the Windows resolver |
+| `Sustained connection` | Fifty or more connections in an hour from one process to one public destination |
 
-**Defender records connections, not bytes.** You cannot read "how much" from
-this query. Estimate it from what was available to take: `FileSize` on the
-staged archives, and the files Phase 7 shows in the folders that were worked
-through. If firewall or proxy logs are in Sentinel, they carry byte counts.
+**From the account, wherever it was used** (`From` = `Account`, only with
+`UserIdentityCheck`):
+
+| Movement | Looks like |
+|---|---|
+| `Mail out` | Attachments mailed to outside addresses |
+| `Cloud sharing` | Anonymous links and external sharing created |
+| `Cloud bulk download` | Twenty or more SharePoint or OneDrive downloads in an hour |
+
+**Defender records connections, not bytes.** `Volume` is filled in only where
+file sizes exist — files copied over SMB, to USB or to `\\tsclient`, and archives
+that were picked up. For internet channels, estimate from what was available to
+take: the archive sizes, and the files Phase 7 shows in the folders that were
+worked through. If firewall or proxy logs are in Sentinel, they carry byte
+counts.
+
+`OrgDevices` on the internet rows is how many devices in the estate use that
+destination. A destination only this device uses is the one to read first.
 
 State your position plainly:
 
 | Evidence | Position |
 |---|---|
-| Archive staged, transfer tool run, connection to the destination | **Exfiltration confirmed.** The content is the archive's source folders. |
-| Archive staged, sustained connection to a rare destination | **Exfiltration probable.** |
-| Files touched or staged, no channel seen | **Possible; cannot be excluded.** |
-| No collection or staging seen | **No evidence** — and state the retention and telemetry limits that bound that. |
+| Archive picked up by a transfer tool, or copied to USB or `\\tsclient`, with volume | **Exfiltration confirmed.** The content is the archive's or the copy's source. |
+| Archive staged, sustained connection or storage service to a rare destination | **Exfiltration probable.** |
+| Files staged or copied to another device, no outbound channel seen | **Staged; exfiltration possible and cannot be excluded.** |
+| No staging or movement seen | **No evidence** — and state the retention and telemetry limits that bound that. |
 
 ### Phase 9 — IOCs and IOAs · 20 minutes
 
@@ -635,7 +692,7 @@ Not everything needs a query.
 - The initial access vector, with the evidence row
 - The attack path, hop by hop, with method and account
 - Every connection channel used: C2, remote access tools, tunnels
-- Files staged, archives built, and the exfiltration position with its confidence
+- What moved away from the device, to where, with volume where known — and the exfiltration position with its confidence
 - The `hok-iocs.kql` output, defanged
 - The ATT&CK techniques observed, by phase
 - Containment and eviction actions, with times
@@ -671,7 +728,7 @@ Stated plainly, because these are the assumptions that close incidents early:
   reads.
 - **No exfil channel does not mean no exfiltration.** Defender has no byte
   counts, and encrypted traffic to a common cloud service looks like everything
-  else.
+  else. A copy to another machine is only visible if that machine is onboarded.
 - **A `ConnectionSuccess` is not proof the connection was allowed.** Network
   protection decides after the TCP handshake.
 - **Nothing in `1-Before` does not mean the device was the first.** The operator
