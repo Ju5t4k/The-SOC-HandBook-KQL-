@@ -1,0 +1,83 @@
+//Node2Shell detection query
+//
+// CVE-2026-111497 (also called HTTP2Shell). One row per server: attempts against Node.js or Bun, and what the runtime did next.
+// The bug is in the Brotli decoder: a request body sent with Content-Encoding: br, or a Brotli response to fetch(). What Node starts, writes and connects to is the evidence.
+let TimeToCheck = 14d;                    // fixed 21 Oct 2026
+let BaselineToCheck = 44d;                // the 30 days before TimeToCheck are "normal"
+let DeviceCheck = "";
+let SourceIPCheck = "";                   // filters the web-log legs only
+//
+// Names of any WAF custom rules you made for this CVE.
+let CustomRules = dynamic(["<node2shell-rule>"]);
+let ExploitPattern = @"(?i)(CVE-2026-111497|node2shell|http2shell|content-encoding.{0,60}\bbr\b)";
+let AlertPattern = @"(?i)(CVE-2026-111497|node2shell|http2shell|web ?shell|web server|exploitation)";
+// Node.js and Bun. pm2 runs as node.
+let Worker = @"(?i)^(node|nodejs|bun)(\.exe)?$";
+let WorkerWords = @"(?i)\b(node|nodejs|bun|pm2)\b";
+// Node starting node is normal, unless it is running inline code.
+let InlineCode = @"\s(-e|--eval|-p|--print)\s";
+// What restarts a crashed Node service.
+let Supervisors = dynamic(["systemd","docker-init","tini","dumb-init","supervisord","containerd-shim","containerd-shim-runc-v2","runc","iisnode.exe","w3wp.exe"]);
+let Shells = dynamic(["sh","bash","dash","zsh","ash","busybox","cmd.exe","powershell.exe","pwsh.exe"]);
+let ReconBins = dynamic(["id","whoami","uname","hostname","ifconfig","ip","netstat","ss","ps","getent","lsb_release","whoami.exe","systeminfo.exe","ipconfig.exe","hostname.exe","net.exe","net1.exe","nltest.exe","tasklist.exe"]);
+let ReconPattern = @"(?i)(/etc/(passwd|shadow|os-release)|/proc/(self/environ|version)|\bwhoami\b|\buname\s+-a|\bifconfig\b)";
+let DownloadPattern = @"(?i)(\b(curl|wget)\b|chmod\s+(\+x|[0-7]{3,4})\s|base64\s+(-d|--decode)|certutil.*-urlcache|invoke-webrequest|\biwr\b|downloadstring|downloadfile|bitsadmin.*/transfer)";
+let ReverseShellPattern = @"(?i)(/dev/(tcp|udp)/|\bnc(at)?(\.exe)?\b.*\s-[ec]\s|\bsocat\b.*exec|\b(ba)?sh\s+-i\b|mkfifo|python[0-9.]*\s+-c\s.*socket|perl\s+-e\s.*socket|net\.socket|child_process|tcpclient)";
+let PersistPattern = @"(?i)(crontab\s|/etc/cron|/var/spool/cron|authorized_keys|systemctl\s+enable|/etc/systemd/system/|/etc/rc\.local|ld\.so\.preload|useradd\s|usermod\s|schtasks(\.exe)?\s+/create|\\currentversion\\run|sc(\.exe)?\s+create|net1?(\.exe)?\s+user\s.*/add)";
+let PersistPaths = @"(?i)(^/etc/cron|^/var/spool/cron|/\.ssh/authorized_keys2?$|^/etc/systemd/system/|^/etc/rc\.local$|^/etc/ld\.so\.preload$|/\.bashrc$|/\.profile$|^/etc/profile\.d/|\\start menu\\programs\\startup\\)";
+let TempPaths = @"(?i)(^/(tmp|var/tmp|dev/shm)/|\\(windows\\temp|programdata|users\\public)\\)";
+let CrashPattern = @"(?i)(segfault at|status=(6/ABRT|7/BUS|11/SEGV)|code=dumped|double free|corrupted size)";
+//
+// Backend addresses in web logs, resolved to the device that held them.
+let IpToServer = DeviceNetworkInfo | where TimeGenerated >= ago(TimeToCheck) | mv-expand Addr = todynamic(IPAddresses) | extend IP = tostring(Addr.IPAddress) | where isnotempty(IP) | summarize Server = take_any(tolower(tostring(split(DeviceName, ".")[0]))) by IP;
+// Servers that ran Node or Bun in the window. Alerts only count on these.
+let NodeHosts = DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where FileName matches regex Worker or InitiatingProcessFileName matches regex Worker | distinct DeviceId;
+// Everything Node started, directly or through a shell.
+let WorkerTree = materialize(DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where InitiatingProcessFileName matches regex Worker or (InitiatingProcessParentFileName matches regex Worker and InitiatingProcessFileName in~ (Shells)) | where not(FileName matches regex Worker) or ProcessCommandLine matches regex InlineCode | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Chain = strcat(InitiatingProcessParentFileName, " > ", InitiatingProcessFileName, " > ", FileName));
+let ChildBaseline = DeviceProcessEvents | where TimeGenerated between (ago(BaselineToCheck) .. ago(TimeToCheck)) | where DeviceName contains DeviceCheck | where InitiatingProcessFileName matches regex Worker or (InitiatingProcessParentFileName matches regex Worker and InitiatingProcessFileName in~ (Shells)) | distinct DeviceId, FileName;
+let NetBaseline = DeviceNetworkEvents | where TimeGenerated between (ago(BaselineToCheck) .. ago(TimeToCheck)) | where DeviceName contains DeviceCheck | where InitiatingProcessFileName matches regex Worker or InitiatingProcessParentFileName matches regex Worker | where RemoteIPType == "Public" | distinct DeviceId, RemoteIP;
+//
+union isfuzzy=true
+    // A program Node has not started on this server in the baseline.
+    (WorkerTree | join kind=leftanti ChildBaseline on DeviceId, FileName | extend Indicator = "New child of Node", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    // Recon: who am I, what box is this.
+    (WorkerTree | where FileName in~ (ReconBins) or ProcessCommandLine matches regex ReconPattern | extend Indicator = "Recon from Node", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    // Fetching or unpacking a second stage.
+    (WorkerTree | where strcat(FileName, " ", ProcessCommandLine) matches regex DownloadPattern | extend Indicator = "Download from Node", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    (WorkerTree | where ProcessCommandLine matches regex ReverseShellPattern | extend Indicator = "Reverse shell", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    (WorkerTree | where ProcessCommandLine matches regex PersistPattern | extend Indicator = "Persistence from Node", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    // Cron, SSH keys, systemd units, startup files written by Node or its children.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where InitiatingProcessFileName matches regex Worker or InitiatingProcessParentFileName matches regex Worker | where FolderPath matches regex PersistPaths | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "Persistence from Node", Evidence = strcat(ActionType, " ", FolderPath, " by ", InitiatingProcessFileName)),
+    // Files dropped in temp by a child of Node. Node's own temp files are excluded.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where InitiatingProcessParentFileName matches regex Worker and not(InitiatingProcessFileName matches regex Worker) | where FolderPath matches regex TempPaths | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "Payload in temp", Evidence = strcat(InitiatingProcessFileName, " wrote ", FolderPath, " SHA256=", SHA256)),
+    // Internet destinations Node's tree has not used before. Node itself on 80/443 is left out (API calls).
+    (DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType in~ ("ConnectionSuccess","ConnectionAttempt","ConnectionFailed") | where RemoteIPType == "Public" | where (InitiatingProcessFileName matches regex Worker and RemotePort !in (80, 443)) or (InitiatingProcessParentFileName matches regex Worker and not(InitiatingProcessFileName matches regex Worker)) | join kind=leftanti NetBaseline on DeviceId, RemoteIP | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "New outbound", Evidence = strcat(InitiatingProcessFileName, " > ", RemoteIP, ":", RemotePort, " ", RemoteUrl), Destination = RemoteIP),
+    // The service restarted three or more times in ten minutes: a crash loop.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where FileName matches regex Worker | where InitiatingProcessFileName in~ (Supervisors) or InitiatingProcessCommandLine has "PM2" | summarize FirstTime = min(TimeGenerated), Starts = count() by DeviceId, DeviceName, ProcessCommandLine, Slot = bin(TimeGenerated, 10m) | where Starts >= 3 | extend TimeGenerated = FirstTime, Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "Restart loop", Evidence = strcat(Starts, " starts in 10 minutes: ", ProcessCommandLine)),
+    // Defender alerts on a Node server that name the CVE, a web shell or the web server.
+    (AlertEvidence | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(DeviceName) and DeviceName contains DeviceCheck | where DeviceId in (NodeHosts) | where Title matches regex AlertPattern | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "Defender alert", Evidence = strcat(ServiceSource, ": ", Title)),
+    // Node crashing. The public exploit is unreliable and usually crashes the process first.
+    (Syslog | where TimeGenerated >= ago(TimeToCheck) | where Computer contains DeviceCheck | where SyslogMessage matches regex CrashPattern | where ProcessName matches regex Worker or SyslogMessage matches regex WorkerWords | extend Server = tolower(tostring(split(Computer, ".")[0])), Indicator = "Worker crash", Evidence = strcat(ProcessName, ": ", substring(SyslogMessage, 0, 300))),
+    (Event | where TimeGenerated >= ago(TimeToCheck) | where Computer contains DeviceCheck | where EventLog == "Application" and EventID == 1000 | where RenderedDescription has_any ("node.exe","bun.exe") | extend Server = tolower(tostring(split(Computer, ".")[0])), Indicator = "Worker crash", Evidence = substring(RenderedDescription, 0, 300)),
+    // WAF hits on a Brotli request body, the CVE, or your own rule. Application Gateway.
+    (AGWFirewallLogs | where TimeGenerated >= ago(TimeToCheck) | where ClientIp contains SourceIPCheck | where RuleId in~ (CustomRules) or strcat(Message, " ", DetailedMessage, " ", DetailedData) matches regex ExploitPattern | extend Server = strcat("host:", Hostname), Indicator = "Exploit request", Evidence = strcat(Action, " ", RuleId, " ", RequestUri, " | ", DetailedData), SourceIP = ClientIp),
+    // Same, for Application Gateway and Front Door logging in the older AzureDiagnostics format.
+    (AzureDiagnostics | where TimeGenerated >= ago(TimeToCheck) | where Category in~ ("ApplicationGatewayFirewallLog","FrontdoorWebApplicationFirewallLog") | extend Rule = strcat(column_ifexists("ruleId_s", ""), column_ifexists("ruleName_s", "")), Ip = strcat(column_ifexists("clientIp_s", ""), column_ifexists("clientIP_s", "")), Text = strcat(column_ifexists("Message", ""), " ", column_ifexists("details_message_s", ""), " ", column_ifexists("details_data_s", ""), " ", column_ifexists("details_msg_s", ""), " ", column_ifexists("details_matches_s", "")) | where Ip contains SourceIPCheck | where Rule in~ (CustomRules) or Text matches regex ExploitPattern | extend Server = strcat("host:", column_ifexists("hostname_s", ""), column_ifexists("host_s", "")), Indicator = "Exploit request", Evidence = strcat(column_ifexists("action_s", ""), " ", Rule, " ", column_ifexists("requestUri_s", ""), " | ", Text), SourceIP = Ip),
+    // Scanners that name the CVE in the user agent.
+    (AGWAccessLogs | where TimeGenerated >= ago(TimeToCheck) | where ClientIp contains SourceIPCheck | where UserAgent matches regex ExploitPattern | extend ServerIP = tostring(split(ServerRouted, ":")[0]) | join kind=leftouter IpToServer on $left.ServerIP == $right.IP | extend Server = iff(isnotempty(Server), Server, strcat("host:", Host)), Indicator = "Exploit request", Evidence = strcat(HttpMethod, " ", RequestUri, " -> ", HttpStatus, " | UA ", UserAgent), SourceIP = ClientIp),
+    (W3CIISLog | where TimeGenerated >= ago(TimeToCheck) | where cIP contains SourceIPCheck | where csUserAgent matches regex ExploitPattern | extend Server = tolower(tostring(split(Computer, ".")[0])), Indicator = "Exploit request", Evidence = strcat(csMethod, " ", csUriStem, " -> ", scStatus, " | UA ", csUserAgent), SourceIP = cIP),
+    // Third-party WAF, IPS and firewall signatures over CEF.
+    (CommonSecurityLog | where TimeGenerated >= ago(TimeToCheck) | where SourceIP contains SourceIPCheck | where strcat(Activity, " ", Message, " ", DeviceEventClassID, " ", RequestClientApplication) matches regex ExploitPattern | join kind=leftouter IpToServer on $left.DestinationIP == $right.IP | extend Server = iff(isnotempty(Server), Server, strcat("host:", coalesce(DestinationHostName, DestinationIP))), Indicator = "Exploit request", Evidence = strcat(DeviceVendor, " ", DeviceProduct, " ", DeviceAction, ": ", Activity, " ", RequestURL)),
+    // The backend closed the connection mid-POST: what a crashing worker looks like from the gateway.
+    (AGWAccessLogs | where TimeGenerated >= ago(TimeToCheck) | where ClientIp contains SourceIPCheck | where HttpMethod =~ "POST" and ErrorInfo =~ "ERRORINFO_UPSTREAM_CLOSED_CONNECTION" | extend ServerIP = tostring(split(ServerRouted, ":")[0]) | join kind=leftouter IpToServer on $left.ServerIP == $right.IP | extend Server = iff(isnotempty(Server), Server, strcat("host:", Host)), Indicator = "Backend dropped POST", Evidence = strcat("POST ", RequestUri, " -> ", HttpStatus, " ", ErrorInfo, " backend ", ServerRouted), SourceIP = ClientIp)
+| where isnotempty(Server) and Server != "host:"
+| summarize Indicators = make_set(Indicator, 15), Events = count(), FirstAttempt = minif(TimeGenerated, Indicator in ("Exploit request","Worker crash","Restart loop","Backend dropped POST")), FirstAction = minif(TimeGenerated, Indicator !in ("Exploit request","Worker crash","Restart loop","Backend dropped POST")), LastSeen = max(TimeGenerated), SourceIPs = make_set_if(SourceIP, isnotempty(SourceIP), 20), Destinations = make_set_if(Destination, isnotempty(Destination), 20), Evidence = make_set(Evidence, 30) by Server
+// 12 indicators, 25 at most. Weights are in docs/webrce-playbook.md.
+| extend Node2ShellScore = toint(set_has_element(Indicators, "Reverse shell")) * 3 + toint(set_has_element(Indicators, "Download from Node")) * 3 + toint(set_has_element(Indicators, "Recon from Node")) * 3 + toint(set_has_element(Indicators, "Persistence from Node")) * 3 + toint(set_has_element(Indicators, "Payload in temp")) * 2 + toint(set_has_element(Indicators, "New outbound")) * 2 + toint(set_has_element(Indicators, "New child of Node")) * 2 + toint(set_has_element(Indicators, "Defender alert")) * 2 + toint(set_has_element(Indicators, "Exploit request")) * 2 + toint(set_has_element(Indicators, "Worker crash")) + toint(set_has_element(Indicators, "Restart loop")) + toint(set_has_element(Indicators, "Backend dropped POST"))
+| extend Verdict = case(array_length(set_intersect(Indicators, dynamic(["Reverse shell","Download from Node","Recon from Node","Persistence from Node","Payload in temp"]))) > 0, "Post-exploitation", array_length(set_intersect(Indicators, dynamic(["New child of Node","New outbound","Defender alert"]))) > 0, "Unusual Node activity", "Attempt only")
+| project Node2ShellScore, Verdict, Server, Indicators, FirstAttempt, FirstAction, LastSeen, SourceIPs, Destinations, Events, Evidence
+| sort by Node2ShellScore desc, LastSeen desc
+//
+//| where Verdict != "Attempt only"                     // servers that need an incident
+//| where Server startswith "host:"                     // web-log hits that did not resolve to a device: find the backend
+//| where FirstAction > FirstAttempt                    // Node misbehaved after an attempt landed

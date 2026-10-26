@@ -1,0 +1,82 @@
+//PHP2Shell detection query
+//
+// CVE-2026-109618 / CVE-2026-109619. One row per server: attempts against PHP, and what PHP did next.
+// The exploit fires before application code runs, so app logs show almost nothing. What PHP starts, writes and connects to is the evidence.
+let TimeToCheck = 14d;                    // first attempts were seen on 17 Oct 2026
+let BaselineToCheck = 44d;                // the 30 days before TimeToCheck are "normal"
+let DeviceCheck = "";
+let SourceIPCheck = "";                   // filters the web-log legs only
+//
+// Names of any WAF custom rules you made for this CVE.
+let CustomRules = dynamic(["<php2shell-rule>"]);
+let ExploitPattern = @"(?i)(PHP_SESSION_UPLOAD_PROGRESS|CVE-2026-10961[89]|php2shell)";
+let AlertPattern = @"(?i)(CVE-2026-10961[89]|php2shell|web ?shell|web server|exploitation)";
+// PHP workers and the web servers that host mod_php. Covers php-fpm8.3, php8.4, php-cgi.exe, lsphp81.
+let Worker = @"(?i)^(php(-fpm|-cgi)?[0-9.]*|lsphp[0-9]*|apache2|httpd)(\.exe)?$";
+let WorkerWords = @"(?i)(php|apache2|httpd|lsphp)";
+let Shells = dynamic(["sh","bash","dash","zsh","ash","busybox","cmd.exe","powershell.exe","pwsh.exe"]);
+let ReconBins = dynamic(["id","whoami","uname","hostname","ifconfig","ip","netstat","ss","ps","getent","lsb_release","whoami.exe","systeminfo.exe","ipconfig.exe","hostname.exe","net.exe","net1.exe","nltest.exe","tasklist.exe"]);
+let ReconPattern = @"(?i)(/etc/(passwd|shadow|os-release)|/proc/(self/environ|version)|\bwhoami\b|\buname\s+-a|\bifconfig\b)";
+let DownloadPattern = @"(?i)(\b(curl|wget)\b|chmod\s+(\+x|[0-7]{3,4})\s|base64\s+(-d|--decode)|certutil.*-urlcache|invoke-webrequest|\biwr\b|downloadstring|downloadfile|bitsadmin.*/transfer)";
+let ReverseShellPattern = @"(?i)(/dev/(tcp|udp)/|\bnc(at)?(\.exe)?\b.*\s-[ec]\s|\bsocat\b.*exec|\b(ba)?sh\s+-i\b|mkfifo|python[0-9.]*\s+-c\s.*socket|perl\s+-e\s.*socket|php\s+-r\s.*fsockopen|tcpclient)";
+let PersistPattern = @"(?i)(crontab\s|/etc/cron|/var/spool/cron|authorized_keys|systemctl\s+enable|/etc/systemd/system/|/etc/rc\.local|ld\.so\.preload|useradd\s|usermod\s|schtasks(\.exe)?\s+/create|\\currentversion\\run|sc(\.exe)?\s+create|net1?(\.exe)?\s+user\s.*/add)";
+let PersistPaths = @"(?i)(^/etc/cron|^/var/spool/cron|/\.ssh/authorized_keys2?$|^/etc/systemd/system/|^/etc/rc\.local$|^/etc/ld\.so\.preload$|/\.bashrc$|/\.profile$|^/etc/profile\.d/|\\start menu\\programs\\startup\\)";
+let ScriptFile = @"(?i)\.(php[0-9s]?|phtml|phar|pht|inc)$";
+// Frameworks compile templates to .php here. Add your own.
+let CacheDirs = @"(?i)/(cache|templates_c|storage/framework/views)/";
+let TempPaths = @"(?i)(^/(tmp|var/tmp|dev/shm)/|\\(windows\\temp|programdata|users\\public)\\)";
+let CrashPattern = @"(?i)(segfault at|exited on signal (6|7|11)|exit signal (segmentation fault|bus error|aborted)|status=(6/ABRT|7/BUS|11/SEGV)|zend_mm_heap corrupted|double free|corrupted size)";
+//
+// Backend addresses in web logs, resolved to the device that held them.
+let IpToServer = DeviceNetworkInfo | where TimeGenerated >= ago(TimeToCheck) | mv-expand Addr = todynamic(IPAddresses) | extend IP = tostring(Addr.IPAddress) | where isnotempty(IP) | summarize Server = take_any(tolower(tostring(split(DeviceName, ".")[0]))) by IP;
+// Servers that ran PHP or Apache in the window. Alerts only count on these.
+let PhpHosts = DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where FileName matches regex Worker or InitiatingProcessFileName matches regex Worker | distinct DeviceId;
+// Everything PHP started, directly or through a shell.
+let WorkerTree = materialize(DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where InitiatingProcessFileName matches regex Worker or (InitiatingProcessParentFileName matches regex Worker and InitiatingProcessFileName in~ (Shells)) | where not(FileName matches regex Worker) | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Chain = strcat(InitiatingProcessParentFileName, " > ", InitiatingProcessFileName, " > ", FileName));
+let ChildBaseline = DeviceProcessEvents | where TimeGenerated between (ago(BaselineToCheck) .. ago(TimeToCheck)) | where DeviceName contains DeviceCheck | where InitiatingProcessFileName matches regex Worker or (InitiatingProcessParentFileName matches regex Worker and InitiatingProcessFileName in~ (Shells)) | distinct DeviceId, FileName;
+let NetBaseline = DeviceNetworkEvents | where TimeGenerated between (ago(BaselineToCheck) .. ago(TimeToCheck)) | where DeviceName contains DeviceCheck | where InitiatingProcessFileName matches regex Worker or InitiatingProcessParentFileName matches regex Worker | where RemoteIPType == "Public" | distinct DeviceId, RemoteIP;
+//
+union isfuzzy=true
+    // A program PHP has not started on this server in the baseline.
+    (WorkerTree | join kind=leftanti ChildBaseline on DeviceId, FileName | extend Indicator = "New child of PHP", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    // Recon: who am I, what box is this.
+    (WorkerTree | where FileName in~ (ReconBins) or ProcessCommandLine matches regex ReconPattern | extend Indicator = "Recon from PHP", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    // Fetching or unpacking a second stage.
+    (WorkerTree | where strcat(FileName, " ", ProcessCommandLine) matches regex DownloadPattern | extend Indicator = "Download from PHP", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    (WorkerTree | where ProcessCommandLine matches regex ReverseShellPattern | extend Indicator = "Reverse shell", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    (WorkerTree | where ProcessCommandLine matches regex PersistPattern | extend Indicator = "Persistence from PHP", Evidence = strcat(Chain, " | ", ProcessCommandLine)),
+    // Cron, SSH keys, systemd units, startup files written by PHP or its children.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where InitiatingProcessFileName matches regex Worker or InitiatingProcessParentFileName matches regex Worker | where FolderPath matches regex PersistPaths | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "Persistence from PHP", Evidence = strcat(ActionType, " ", FolderPath, " by ", InitiatingProcessFileName)),
+    // PHP files written by PHP: a web shell, or a CMS update.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where InitiatingProcessFileName matches regex Worker or InitiatingProcessParentFileName matches regex Worker | where FileName matches regex ScriptFile and not(FolderPath matches regex CacheDirs) | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "Script written by PHP", Evidence = strcat(ActionType, " ", FolderPath, " SHA256=", SHA256)),
+    // Files dropped in temp by a child of PHP. PHP's own upload temp files are excluded.
+    (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where InitiatingProcessParentFileName matches regex Worker and not(InitiatingProcessFileName matches regex Worker) | where FolderPath matches regex TempPaths | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "Payload in temp", Evidence = strcat(InitiatingProcessFileName, " wrote ", FolderPath, " SHA256=", SHA256)),
+    // Internet destinations PHP's tree has not used before. PHP itself on 80/443 is left out (API calls).
+    (DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType in~ ("ConnectionSuccess","ConnectionAttempt","ConnectionFailed") | where RemoteIPType == "Public" | where (InitiatingProcessFileName matches regex Worker and RemotePort !in (80, 443)) or (InitiatingProcessParentFileName matches regex Worker and not(InitiatingProcessFileName matches regex Worker)) | join kind=leftanti NetBaseline on DeviceId, RemoteIP | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "New outbound", Evidence = strcat(InitiatingProcessFileName, " > ", RemoteIP, ":", RemotePort, " ", RemoteUrl), Destination = RemoteIP),
+    // Defender alerts on a PHP server that name the CVE, a web shell or the web server.
+    (AlertEvidence | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(DeviceName) and DeviceName contains DeviceCheck | where DeviceId in (PhpHosts) | where Title matches regex AlertPattern | extend Server = tolower(tostring(split(DeviceName, ".")[0])), Indicator = "Defender alert", Evidence = strcat(ServiceSource, ": ", Title)),
+    // PHP or Apache crashing. Most public exploits crash the worker even when they fail.
+    (Syslog | where TimeGenerated >= ago(TimeToCheck) | where Computer contains DeviceCheck | where SyslogMessage matches regex CrashPattern | where ProcessName matches regex Worker or SyslogMessage matches regex WorkerWords | extend Server = tolower(tostring(split(Computer, ".")[0])), Indicator = "Worker crash", Evidence = strcat(ProcessName, ": ", substring(SyslogMessage, 0, 300))),
+    (Event | where TimeGenerated >= ago(TimeToCheck) | where Computer contains DeviceCheck | where EventLog == "Application" and EventID == 1000 | where RenderedDescription has_any ("php-cgi.exe","php.exe") | extend Server = tolower(tostring(split(Computer, ".")[0])), Indicator = "Worker crash", Evidence = substring(RenderedDescription, 0, 300)),
+    // WAF hits on the upload-progress field, the CVE, or your own rule. Application Gateway.
+    (AGWFirewallLogs | where TimeGenerated >= ago(TimeToCheck) | where ClientIp contains SourceIPCheck | where RuleId in~ (CustomRules) or strcat(Message, " ", DetailedMessage, " ", DetailedData) matches regex ExploitPattern | extend Server = strcat("host:", Hostname), Indicator = "Exploit request", Evidence = strcat(Action, " ", RuleId, " ", RequestUri, " | ", DetailedData), SourceIP = ClientIp),
+    // Same, for Application Gateway and Front Door logging in the older AzureDiagnostics format.
+    (AzureDiagnostics | where TimeGenerated >= ago(TimeToCheck) | where Category in~ ("ApplicationGatewayFirewallLog","FrontdoorWebApplicationFirewallLog") | extend Rule = strcat(column_ifexists("ruleId_s", ""), column_ifexists("ruleName_s", "")), Ip = strcat(column_ifexists("clientIp_s", ""), column_ifexists("clientIP_s", "")), Text = strcat(column_ifexists("Message", ""), " ", column_ifexists("details_message_s", ""), " ", column_ifexists("details_data_s", ""), " ", column_ifexists("details_msg_s", ""), " ", column_ifexists("details_matches_s", "")) | where Ip contains SourceIPCheck | where Rule in~ (CustomRules) or Text matches regex ExploitPattern | extend Server = strcat("host:", column_ifexists("hostname_s", ""), column_ifexists("host_s", "")), Indicator = "Exploit request", Evidence = strcat(column_ifexists("action_s", ""), " ", Rule, " ", column_ifexists("requestUri_s", ""), " | ", Text), SourceIP = Ip),
+    // Scanners that name the CVE in the user agent.
+    (AGWAccessLogs | where TimeGenerated >= ago(TimeToCheck) | where ClientIp contains SourceIPCheck | where UserAgent matches regex ExploitPattern | extend ServerIP = tostring(split(ServerRouted, ":")[0]) | join kind=leftouter IpToServer on $left.ServerIP == $right.IP | extend Server = iff(isnotempty(Server), Server, strcat("host:", Host)), Indicator = "Exploit request", Evidence = strcat(HttpMethod, " ", RequestUri, " -> ", HttpStatus, " | UA ", UserAgent), SourceIP = ClientIp),
+    (W3CIISLog | where TimeGenerated >= ago(TimeToCheck) | where cIP contains SourceIPCheck | where csUserAgent matches regex ExploitPattern | extend Server = tolower(tostring(split(Computer, ".")[0])), Indicator = "Exploit request", Evidence = strcat(csMethod, " ", csUriStem, " -> ", scStatus, " | UA ", csUserAgent), SourceIP = cIP),
+    // Third-party WAF, IPS and firewall signatures over CEF.
+    (CommonSecurityLog | where TimeGenerated >= ago(TimeToCheck) | where SourceIP contains SourceIPCheck | where strcat(Activity, " ", Message, " ", DeviceEventClassID, " ", RequestClientApplication) matches regex ExploitPattern | join kind=leftouter IpToServer on $left.DestinationIP == $right.IP | extend Server = iff(isnotempty(Server), Server, strcat("host:", coalesce(DestinationHostName, DestinationIP))), Indicator = "Exploit request", Evidence = strcat(DeviceVendor, " ", DeviceProduct, " ", DeviceAction, ": ", Activity, " ", RequestURL)),
+    // The backend closed the connection mid-POST: what a crashing worker looks like from the gateway.
+    (AGWAccessLogs | where TimeGenerated >= ago(TimeToCheck) | where ClientIp contains SourceIPCheck | where HttpMethod =~ "POST" and ErrorInfo =~ "ERRORINFO_UPSTREAM_CLOSED_CONNECTION" | extend ServerIP = tostring(split(ServerRouted, ":")[0]) | join kind=leftouter IpToServer on $left.ServerIP == $right.IP | extend Server = iff(isnotempty(Server), Server, strcat("host:", Host)), Indicator = "Backend dropped POST", Evidence = strcat("POST ", RequestUri, " -> ", HttpStatus, " ", ErrorInfo, " backend ", ServerRouted), SourceIP = ClientIp)
+| where isnotempty(Server) and Server != "host:"
+| summarize Indicators = make_set(Indicator, 15), Events = count(), FirstAttempt = minif(TimeGenerated, Indicator in ("Exploit request","Worker crash","Backend dropped POST")), FirstAction = minif(TimeGenerated, Indicator !in ("Exploit request","Worker crash","Backend dropped POST")), LastSeen = max(TimeGenerated), SourceIPs = make_set_if(SourceIP, isnotempty(SourceIP), 20), Destinations = make_set_if(Destination, isnotempty(Destination), 20), Evidence = make_set(Evidence, 30) by Server
+// 12 indicators, 26 at most. Weights are in docs/webrce-playbook.md.
+| extend Php2ShellScore = toint(set_has_element(Indicators, "Reverse shell")) * 3 + toint(set_has_element(Indicators, "Download from PHP")) * 3 + toint(set_has_element(Indicators, "Recon from PHP")) * 3 + toint(set_has_element(Indicators, "Persistence from PHP")) * 3 + toint(set_has_element(Indicators, "Script written by PHP")) * 2 + toint(set_has_element(Indicators, "Payload in temp")) * 2 + toint(set_has_element(Indicators, "New outbound")) * 2 + toint(set_has_element(Indicators, "New child of PHP")) * 2 + toint(set_has_element(Indicators, "Defender alert")) * 2 + toint(set_has_element(Indicators, "Exploit request")) * 2 + toint(set_has_element(Indicators, "Worker crash")) + toint(set_has_element(Indicators, "Backend dropped POST"))
+| extend Verdict = case(array_length(set_intersect(Indicators, dynamic(["Reverse shell","Download from PHP","Recon from PHP","Persistence from PHP","Script written by PHP","Payload in temp"]))) > 0, "Post-exploitation", array_length(set_intersect(Indicators, dynamic(["New child of PHP","New outbound","Defender alert"]))) > 0, "Unusual PHP activity", "Attempt only")
+| project Php2ShellScore, Verdict, Server, Indicators, FirstAttempt, FirstAction, LastSeen, SourceIPs, Destinations, Events, Evidence
+| sort by Php2ShellScore desc, LastSeen desc
+//
+//| where Verdict != "Attempt only"                     // servers that need an incident
+//| where Server startswith "host:"                     // web-log hits that did not resolve to a device: find the backend
+//| where FirstAction > FirstAttempt                    // PHP misbehaved after an attempt landed

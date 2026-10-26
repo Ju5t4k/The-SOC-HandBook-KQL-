@@ -28,15 +28,20 @@
 | [`hok-web.kql`](hok-web.kql) | `Device*`, `UrlClickEvents` | Browsing, downloads with the page that linked them, command-line downloads, SmartScreen, network protection, Safe Links |
 | [`hok-lateral.kql`](hok-lateral.kql) | `Device*`, `Identity*` | Hops out of the device seen from both ends and from the domain controller, plus everywhere the account logged on |
 | [`hok-files.kql`](hok-files.kql) | `DeviceFileEvents`, `DeviceEvents`, `CloudAppEvents` | Files opened, dropped, archived, changed over SMB, deleted, renamed, labelled, copied to removable media, pulled from SharePoint |
-| [`hok-persistence.kql`](hok-persistence.kql) | `Device*` | What an operator leaves to come back: accounts, services, tasks, autoruns, logon-screen backdoors, RDP and WinRM switched on, remote tools, WMI subscriptions, LSA packages, web shells, SSH keys |
+| [`hok-persistence.kql`](hok-persistence.kql) | `Device*` | What an operator leaves to come back: accounts, services, tasks, autoruns, logon-screen backdoors, RDP and WinRM switched on, remote tools, WMI subscriptions, LSA packages, web shells, SSH keys, and Linux cron, systemd, shell profiles and sudoers |
 | [`hok-exfil.kql`](hok-exfil.kql) | `Device*`, `CloudAppEvents`, `EmailEvents` | What moved away from the device and where it went: to another machine over SMB, to the RDP client, to USB, and to the internet by tool, browser, file protocol, DNS or sustained connection — with volume where file sizes exist |
 | [`hok-iocs.kql`](hok-iocs.kql) | `AlertEvidence`, `Device*` | Every indicator from the window in one table — alert evidence plus rare hashes, destinations, URLs, accounts, persistence names and command lines |
 | [`hok-scope.kql`](hok-scope.kql) | `Device*`, `Identity*`, `CloudAppEvents`, `Email*` | Any indicator from `hok-iocs.kql`, swept across the estate |
 | [`hok-enrich-ah.kql`](hok-enrich-ah.kql) | Advanced Hunting only | `FileProfile()` on every file the device ran or wrote: global prevalence, first seen, signer |
+| [`php2shell.kql`](php2shell.kql) | `Device*`, `Syslog`, `Event`, `AlertEvidence`, App Gateway, Front Door, IIS, CEF | PHP2Shell (CVE-2026-109618/109619). One row per server: exploit attempts, crashes, and what PHP did next. Scored, with a `Verdict` |
+| [`node2shell.kql`](node2shell.kql) | same | Node2Shell (CVE-2026-111497). The same for Node.js and Bun, plus crash-restart loops |
+| [`webrce-requests.kql`](webrce-requests.kql) | App Gateway, Front Door, `W3CIISLog`, `CommonSecurityLog` | Every web request from an address, to a host or for a path, with the backend and what came back |
+| [`webrce-exposure.kql`](webrce-exposure.kql) | `Device*` | Which devices run PHP, Node.js or Bun, which take internet traffic, and whether the version in the path is fixed |
+| [`webrce-exposure-ah.kql`](webrce-exposure-ah.kql) | Advanced Hunting only | Defender Vulnerability Management's view of the same CVEs, plus every PHP and Node install checked against the fixed versions |
 
 The first three are identity and activity tables and run in sequence.
 
-The `clickfix-*`, `devicecode-*`, `bec-*`, `attachment-*` and `hok-*` files are
+The `clickfix-*`, `devicecode-*`, `bec-*`, `attachment-*`, `hok-*` and `webrce-*` files (with `php2shell.kql` and `node2shell.kql`) are
 threat-specific and meant to be worked in order. Each set has a playbook with
 the steps, containment order and ticket checklist:
 
@@ -51,6 +56,8 @@ the steps, containment order and ticket checklist:
 - [`../docs/hok-playbook.md`](../docs/hok-playbook.md) — a person operating
   inside the estate: connections, web, files, lateral movement, exfiltration,
   IOCs and IOAs, and the root cause analysis
+- [`../docs/webrce-playbook.md`](../docs/webrce-playbook.md) — web servers,
+  PHP2Shell and Node2Shell exposure and exploitation
 
 ## The order to run them in
 

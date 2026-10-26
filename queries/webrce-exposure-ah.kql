@@ -1,0 +1,25 @@
+//Web runtime exposure query — ADVANCED HUNTING ONLY
+//
+// Defender portal only (vulnerability tables never reach Sentinel); time column is Timestamp.
+// Devices Defender Vulnerability Management flags for PHP2Shell or Node2Shell, plus every PHP, Node.js and Bun install with its version checked.
+let Cves = dynamic(["CVE-2026-109618","CVE-2026-109619","CVE-2026-111497"]);
+// First fixed release per branch (21 Oct 2026). A branch not listed has no fix.
+let Fixed = dynamic({"php 8.2":"8.2.35","php 8.3":"8.3.36","php 8.4":"8.4.27","php 8.5":"8.5.12","node 22":"22.23.4","node 24":"24.22.1","node 26":"26.12.1","bun 1":"1.4.4"});
+//
+union
+    (DeviceTvmSoftwareVulnerabilities | where CveId in (Cves) | project DeviceId, DeviceName, SoftwareVendor, SoftwareName, SoftwareVersion, CveId, Update = RecommendedSecurityUpdate),
+    // Inventory as a cross-check: a CVE not yet mapped in Defender does not mean not vulnerable.
+    (DeviceTvmSoftwareInventory | where SoftwareName matches regex @"(?i)^(php|node|node\.js|nodejs|bun)$" | project DeviceId, DeviceName, SoftwareVendor, SoftwareName, SoftwareVersion, EndOfSupportStatus)
+| summarize Cves = make_set_if(CveId, isnotempty(CveId), 5), Update = take_anyif(Update, isnotempty(Update)), EndOfSupport = take_anyif(EndOfSupportStatus, isnotempty(EndOfSupportStatus)) by DeviceId, DeviceName, SoftwareVendor, SoftwareName, SoftwareVersion
+| extend Product = case(SoftwareName has "php", "php", SoftwareName has "bun", "bun", "node")
+| extend Version = extract(@"^(\d+\.\d+(?:\.\d+)?)", 1, SoftwareVersion)
+| extend Branch = iff(Product == "php", extract(@"^(\d+\.\d+)", 1, Version), extract(@"^(\d+)", 1, Version))
+| extend FixedIn = tostring(Fixed[strcat(Product, " ", Branch)])
+| extend Status = case(array_length(Cves) > 0, "Vulnerable (Defender)", isempty(Version), "Unknown version", isempty(FixedIn), "No fix: unsupported branch", parse_version(Version) < parse_version(FixedIn), "Vulnerable (version)", "Fixed")
+| join kind=leftouter (DeviceInfo | summarize arg_max(Timestamp, *) by DeviceId | project DiDeviceId = DeviceId, IsInternetFacing, PublicIP, DeviceOS = OSPlatform) on $left.DeviceId == $right.DiDeviceId
+| project Status, IsInternetFacing, DeviceName, SoftwareVendor, SoftwareName, SoftwareVersion, FixedIn, Cves, Update, EndOfSupport, PublicIP, DeviceOS, DeviceId
+| sort by IsInternetFacing desc, Status desc, DeviceName asc
+//
+//| where Status != "Fixed"                          // still to patch
+//| where IsInternetFacing                           // patch these first
+// Distro packages backport fixes without changing the upstream version. Check the vendor advisory before closing a "Vulnerable (version)" row.

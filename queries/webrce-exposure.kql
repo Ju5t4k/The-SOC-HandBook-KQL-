@@ -1,0 +1,35 @@
+//Web runtime exposure query
+//
+// Which devices run PHP, Node.js or Bun, which of them take connections from the internet, and whether the version in the path is fixed.
+// Sentinel cannot see Defender's vulnerability tables. For the CVE list from Defender, run webrce-exposure-ah.kql in Advanced Hunting.
+let TimeToCheck = 7d;
+let DeviceCheck = "";
+//
+let Runtime = @"(?i)^(php(-fpm|-cgi)?[0-9.]*|lsphp[0-9]*|node|nodejs|bun)(\.exe)?$";
+// First fixed release per branch (21 Oct 2026). A branch not listed has no fix.
+let Fixed = dynamic({"php 8.2":"8.2.35","php 8.3":"8.3.36","php 8.4":"8.4.27","php 8.5":"8.5.12","node 22":"22.23.4","node 24":"24.22.1","node 26":"26.12.1","bun 1":"1.4.4"});
+//
+union isfuzzy=true
+    // The runtime starting, or starting something.
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where FileName matches regex Runtime | project TimeGenerated, DeviceId, DeviceName, Bin = FileName, Path = FolderPath, Cmd = ProcessCommandLine),
+    (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where InitiatingProcessFileName matches regex Runtime | project TimeGenerated, DeviceId, DeviceName, Bin = InitiatingProcessFileName, Path = InitiatingProcessFolderPath, Cmd = InitiatingProcessCommandLine),
+    // The runtime accepting connections. Long-running servers show here even when they never restart.
+    (DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceName contains DeviceCheck | where ActionType in~ ("InboundConnectionAccepted","ListeningConnectionCreated") | where InitiatingProcessFileName matches regex Runtime | project TimeGenerated, DeviceId, DeviceName, Bin = InitiatingProcessFileName, Path = InitiatingProcessFolderPath, Cmd = InitiatingProcessCommandLine, PublicClient = iff(ActionType =~ "InboundConnectionAccepted" and RemoteIPType == "Public", RemoteIP, ""), LocalPort)
+| extend Product = case(Bin matches regex @"(?i)^(php|lsphp)", "php", Bin matches regex @"(?i)^bun", "bun", "node")
+// Version from the binary path: /usr/sbin/php-fpm8.3, /opt/php/8.4.26/, ~/.nvm/versions/node/v24.22.0/. Command lines are left out: app paths carry their own numbers.
+| extend Version = extract(@"(?i)(?:php|lsphp|node|nodejs|bun)[^0-9]{0,12}v?(\d+\.\d+(?:\.\d+)?)", 1, strcat(Path, " ", Bin))
+| summarize Paths = make_set(Path, 5), Commands = make_set(Cmd, 5), PublicClients = dcountif(PublicClient, isnotempty(PublicClient)), SamplePublicClients = make_set_if(PublicClient, isnotempty(PublicClient), 5), Ports = make_set_if(LocalPort, isnotnull(LocalPort), 10), LastSeen = max(TimeGenerated) by DeviceId, DeviceName, Product, Version
+| extend Branch = iff(Product == "php", extract(@"^(\d+\.\d+)", 1, Version), extract(@"^(\d+)", 1, Version))
+| extend FixedIn = tostring(Fixed[strcat(Product, " ", Branch)])
+| extend Status = case(isempty(Version), "Unknown: run php -v / node -v", isempty(FixedIn), "No fix: unsupported branch", not(Version matches regex @"^\d+\.\d+\.\d+$"), "Branch only: check the package version", parse_version(Version) < parse_version(FixedIn), "Vulnerable", "Fixed")
+| extend Rank = case(Status == "Vulnerable", 1, Status startswith "No fix", 2, Status startswith "Branch", 3, Status startswith "Unknown", 4, 5)
+| join kind=leftouter (DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project DiDeviceId = DeviceId, DefenderSaysFacing = column_ifexists("IsInternetFacing", bool(null)), PublicIP, DeviceOS = OSPlatform) on $left.DeviceId == $right.DiDeviceId
+| extend InternetFacing = PublicClients > 0 or DefenderSaysFacing == true
+| project Status, InternetFacing, DeviceName, Product, Version, FixedIn, Paths, Commands, Ports, PublicClients, SamplePublicClients, PublicIP, DeviceOS, LastSeen, Rank
+| sort by InternetFacing desc, Rank asc, DeviceName asc
+| project-away Rank
+//
+//| where Status !in ("Fixed")                       // everything still to patch or check
+//| where InternetFacing                              // patch these first
+// Distro packages (Ubuntu, Debian, RHEL) backport fixes without changing the upstream version. "Branch only" means read the package changelog.
+// Patched packages do nothing until every PHP-FPM, Apache or Node worker is restarted.

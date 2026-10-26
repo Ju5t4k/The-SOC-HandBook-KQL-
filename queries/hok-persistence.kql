@@ -1,7 +1,7 @@
 //Hands-on-keyboard persistence query
 //
 // What an operator left to come back: accounts, services, tasks, autoruns, backdoors,
-// remote access switched on, remote tools, WMI, LSA packages, web shells, SSH keys.
+// remote access switched on, remote tools, WMI, LSA packages, web shells, SSH keys, and on Linux cron, systemd, shell profiles and sudoers.
 let IncidentStart = ago(1d);              // first known attacker activity, e.g. datetime(2026-10-05T14:32:00Z)
 let IncidentEnd = now();
 let LookBefore = 7d;
@@ -13,7 +13,12 @@ let StartTime = IncidentStart - LookBefore;
 let EndTime = IncidentEnd + LookAfter;
 let RmmPattern = @"(?i)(anydesk|screenconnect|connectwise|atera|splashtop|teamviewer|rustdesk|netsupport|client32|meshagent|syncro|action1|logmein|gotoassist|supremo|ultraviewer|dwagent|tightvnc|ngrok|cloudflared)";
 let AccessibilityBins = @"(?i)\\windows\\(system32|syswow64)\\(sethc|utilman|osk|narrator|magnify|displayswitch|atbroker)\.exe$";
-let WebRoots = @"(?i)\\(inetpub|wwwroot|frontend\\httpproxy|webapps|htdocs|exchange server\\v\d+\\clientaccess)\\";
+// Windows and Linux web roots.
+let WebRoots = @"(?i)(\\(inetpub|wwwroot|frontend\\httpproxy|webapps|htdocs|exchange server\\v\d+\\clientaccess)\\|^/(var/www|srv/www|srv/http|usr/share/nginx|opt/bitnami)/|/(public_html|htdocs|webapps)/)";
+let LinuxPersistPaths = @"(?i)(^/etc/cron|^/var/spool/cron|^/(etc|lib|usr/lib)/systemd/system/|/\.config/systemd/user/|^/etc/rc\.local$|^/etc/ld\.so\.preload$|^/etc/profile(\.d/|$)|^/etc/bash\.bashrc$|/\.(bashrc|bash_profile|profile|zshrc)$|^/etc/sudoers)";
+let LinuxPersistCmd = @"(?i)(\bcrontab\s+(-[er]\b|[^-\s])|systemctl\s+(--user\s+)?enable\b|\b(useradd|adduser)\s|\busermod\s.*-a?G\s*\S*(sudo|wheel|root|adm))";
+// Package installs and updates write units and cron files legitimately.
+let LinuxUpdaters = dynamic(["dpkg","apt","apt-get","unattended-upgr","yum","dnf","rpm","zypper","snapd","packagekitd"]);
 let WindowsUpdaters = dynamic(["TrustedInstaller.exe","TiWorker.exe","msiexec.exe","svchost.exe"]);
 //
 union isfuzzy=true
@@ -43,9 +48,12 @@ union isfuzzy=true
     // User-hive COM hijacks and forced browser extensions.
     (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("RegistryValueSet","RegistryKeyCreated") | where (RegistryKey has @"Classes\CLSID" and RegistryKey has_any ("InprocServer32","LocalServer32","TreatAs")) or RegistryKey has "ExtensionInstallForcelist" | extend Method = iff(RegistryKey has "ExtensionInstallForcelist", "Browser extension", "COM hijack"), Technique = iff(RegistryKey has "ExtensionInstallForcelist", "T1176", "T1546.015"), Actor = InitiatingProcessAccountName, Location = strcat(RegistryKey, "\\", RegistryValueName), Payload = RegistryValueData, SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine),
     // Script files written into a web root.
-    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where FileName matches regex @"(?i)\.(aspx|ashx|asmx|asp|jsp|jspx|php|cfm)$" | where FolderPath matches regex WebRoots | extend Method = "Web shell", Technique = "T1505.003", Actor = InitiatingProcessAccountName, Location = FolderPath, Payload = strcat("SHA256=", SHA256), SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine),
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where FileName matches regex @"(?i)\.(aspx|ashx|asmx|asp|jsp|jspx|php[0-9]?|phtml|phar|cfm)$" | where FolderPath matches regex WebRoots | extend Method = "Web shell", Technique = "T1505.003", Actor = InitiatingProcessAccountName, Location = FolderPath, Payload = strcat("SHA256=", SHA256), SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine),
     // authorized_keys planted or changed.
-    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified") | where FileName in~ ("authorized_keys","administrators_authorized_keys","authorized_keys2") | extend Method = "SSH key", Technique = "T1098.004", Actor = InitiatingProcessAccountName, Location = FolderPath, Payload = strcat("SHA256=", SHA256), SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine)
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified") | where FileName in~ ("authorized_keys","administrators_authorized_keys","authorized_keys2") | extend Method = "SSH key", Technique = "T1098.004", Actor = InitiatingProcessAccountName, Location = FolderPath, Payload = strcat("SHA256=", SHA256), SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine),
+    // Linux: cron jobs, systemd units and timers, shell profiles, rc.local, ld.so.preload, sudoers. Package managers excluded.
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where FolderPath matches regex LinuxPersistPaths | where InitiatingProcessFileName !in~ (LinuxUpdaters) and InitiatingProcessParentFileName !in~ (LinuxUpdaters) | extend Method = case(FolderPath contains "cron", "Cron", FolderPath contains "systemd", "Systemd unit", FolderPath contains "sudoers", "Account", "Shell profile or preload"), Technique = case(FolderPath contains "cron", "T1053.003", FolderPath contains "systemd", "T1543.002", FolderPath contains "sudoers", "T1548.003", FolderPath contains "ld.so.preload", "T1574.006", FolderPath contains "rc.local", "T1037.004", "T1546.004"), Actor = InitiatingProcessAccountName, Location = FolderPath, Payload = strcat("SHA256=", SHA256), SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine),
+    (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ProcessCommandLine matches regex LinuxPersistCmd | where InitiatingProcessFileName !in~ (LinuxUpdaters) and InitiatingProcessParentFileName !in~ (LinuxUpdaters) | extend Method = case(ProcessCommandLine contains "crontab", "Cron", ProcessCommandLine contains "systemctl", "Systemd unit", "Account"), Technique = case(ProcessCommandLine contains "crontab", "T1053.003", ProcessCommandLine contains "systemctl", "T1543.002", ProcessCommandLine contains "usermod", "T1098", "T1136.001"), Actor = AccountName, Location = FileName, Payload = ProcessCommandLine, SetBy = InitiatingProcessFileName, SetByCmd = InitiatingProcessCommandLine)
 | where Actor contains UserIdentityCheck
 | extend Window = case(TimeGenerated < IncidentStart, "1-Before", TimeGenerated <= IncidentEnd, "2-During", "3-After")
 | project-rename EventTime = TimeGenerated

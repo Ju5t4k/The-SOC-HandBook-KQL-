@@ -1,0 +1,27 @@
+//Web requests query
+//
+// Every logged web request from an address, to a host, or for a path, across Application Gateway, Front Door, IIS and CEF devices.
+// Use it with php2shell.kql and node2shell.kql: what else the attacker sent, which backend got it, and what came back.
+let TimeToCheck = 14d;
+let SourceIPCheck = "";                   // e.g. 203.0.113.10
+let HostCheck = "";                       // e.g. shop.contoso.com
+let UriCheck = "";                        // e.g. index.php
+//
+union isfuzzy=true
+    (AGWAccessLogs | where TimeGenerated >= ago(TimeToCheck) | project TimeGenerated, Source = "AppGateway", ClientIP = ClientIp, Method = HttpMethod, Host, Uri = RequestUri, Status = tostring(HttpStatus), Backend = strcat(ServerRouted, " ", ServerStatus), Error = ErrorInfo, UserAgent, BytesIn = tolong(ReceivedBytes), Waf = WafMode, Ref = TransactionId),
+    (AGWFirewallLogs | where TimeGenerated >= ago(TimeToCheck) | project TimeGenerated, Source = "AppGateway WAF", ClientIP = ClientIp, Host = Hostname, Uri = RequestUri, Waf = strcat(Action, " ", RuleId, " ", Message, " | ", DetailedData), Ref = TransactionId),
+    // Older AzureDiagnostics format, Application Gateway and Front Door. Column names differ by product, hence column_ifexists.
+    (AzureDiagnostics | where TimeGenerated >= ago(TimeToCheck) | where Category in~ ("ApplicationGatewayAccessLog","FrontdoorAccessLog") | project TimeGenerated, Source = Category, ClientIP = strcat(column_ifexists("clientIP_s", ""), column_ifexists("clientIp_s", "")), Method = column_ifexists("httpMethod_s", ""), Host = column_ifexists("host_s", ""), Uri = column_ifexists("requestUri_s", ""), Status = strcat(column_ifexists("httpStatus_d", ""), column_ifexists("httpStatusCode_s", "")), Backend = strcat(column_ifexists("serverRouted_s", ""), column_ifexists("originName_s", "")), Error = strcat(column_ifexists("error_info_s", ""), column_ifexists("errorInfo_s", "")), UserAgent = column_ifexists("userAgent_s", ""), Ref = strcat(column_ifexists("transactionId_g", ""), column_ifexists("trackingReference_s", ""))),
+    (AzureDiagnostics | where TimeGenerated >= ago(TimeToCheck) | where Category in~ ("ApplicationGatewayFirewallLog","FrontdoorWebApplicationFirewallLog") | project TimeGenerated, Source = Category, ClientIP = strcat(column_ifexists("clientIP_s", ""), column_ifexists("clientIp_s", "")), Host = strcat(column_ifexists("hostname_s", ""), column_ifexists("host_s", "")), Uri = column_ifexists("requestUri_s", ""), Waf = strcat(column_ifexists("action_s", ""), " ", column_ifexists("ruleId_s", ""), column_ifexists("ruleName_s", ""), " ", column_ifexists("Message", ""), " | ", column_ifexists("details_data_s", ""), column_ifexists("details_msg_s", "")), Ref = strcat(column_ifexists("transactionId_g", ""), column_ifexists("trackingReference_s", ""))),
+    // IIS on the server itself (PHP via FastCGI, Node via iisnode).
+    (W3CIISLog | where TimeGenerated >= ago(TimeToCheck) | project TimeGenerated, Source = strcat("IIS ", Computer), ClientIP = cIP, Method = csMethod, Host = coalesce(csHost, sSiteName), Uri = strcat(csUriStem, iff(isnotempty(csUriQuery) and csUriQuery != "-", strcat("?", csUriQuery), "")), Status = strcat(scStatus, ".", scSubStatus), Backend = Computer, UserAgent = csUserAgent, BytesIn = tolong(csBytes)),
+    // Third-party WAF, proxy and IPS over CEF.
+    (CommonSecurityLog | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(RequestURL) | project TimeGenerated, Source = strcat(DeviceVendor, " ", DeviceProduct), ClientIP = SourceIP, Method = RequestMethod, Host = DestinationHostName, Uri = RequestURL, Backend = DestinationIP, UserAgent = RequestClientApplication, Waf = strcat(DeviceAction, " ", Activity))
+| where ClientIP contains SourceIPCheck and Host contains HostCheck and Uri contains UriCheck
+| project TimeGenerated, Source, ClientIP, Method, Host, Uri, Status, Backend, Error, Waf, UserAgent, BytesIn, Ref
+| sort by TimeGenerated asc
+//
+//| where Method =~ "POST"                                           // exploit attempts are POSTs
+//| where Error =~ "ERRORINFO_UPSTREAM_CLOSED_CONNECTION"             // the backend died mid-request
+//| summarize Requests = count(), Posts = countif(Method =~ "POST"), Dropped = countif(Error =~ "ERRORINFO_UPSTREAM_CLOSED_CONNECTION"), Hosts = make_set(Host, 20), Agents = make_set(UserAgent, 5), First = min(TimeGenerated), Last = max(TimeGenerated) by ClientIP   // one line per attacker
+//| summarize Attackers = dcount(ClientIP), Requests = count() by Host, Backend   // which servers were hit

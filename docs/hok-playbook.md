@@ -234,7 +234,7 @@ Safe Links click         clicks in mail, Teams, Office
 **Run** `hok-persistence.kql`.
 
 ```
-Account                 local accounts created or added to a group
+Account                 local accounts created or added to a group; Linux useradd, sudo group, sudoers
 Service                 services created
 Scheduled task          tasks created
 Autorun                 run keys, Winlogon, Startup folder
@@ -246,8 +246,11 @@ LSA package             DLL loaded into LSASS
 Netsh helper            DLL loaded by netsh
 COM hijack              user-hive CLSID hijack
 Browser extension       extension forced by policy
-Web shell               script written into a web root
+Web shell               script written into a web root (Windows or Linux)
 SSH key                 authorized_keys planted or changed
+Cron                    Linux cron file or crontab edited
+Systemd unit            Linux service or timer written or enabled
+Shell profile or preload  .bashrc, /etc/profile.d, rc.local, ld.so.preload
 ```
 
 `Account`, `Logon-screen backdoor`, `Remote access enabled`, `Web shell` and `SSH key` need no malware to get back in — the ones a tool clean-up misses.
