@@ -1,246 +1,171 @@
-# Business email compromise — end-to-end investigation
+# Business email compromise — investigation playbook
 
-For when a mailbox rule, a forwarding address, a supplier complaint or a
-finance query points at BEC and you have to work out what was read, what was
-sent, and what is still set.
+**Use when** a mailbox rule, a forwarding address, a supplier complaint or a finance query points at BEC.
+**Goal:** establish how they got in, what they read, what they sent, and what is still set.
 
-| Query | Phase |
+| Step | Query |
 |---|---|
-| [`bec.kql`](../queries/bec.kql) | 0 — confirm |
-| [`bec-timeline.kql`](../queries/bec-timeline.kql) | 1–4 — reconstruct |
-| [`bec-persistence.kql`](../queries/bec-persistence.kql) | 5 — what is still set |
-| [`bec-scope.kql`](../queries/bec-scope.kql) | 6 — who else |
+| 1 Confirm | [`bec.kql`](../queries/bec.kql) |
+| 2 Reconstruct | [`bec-timeline.kql`](../queries/bec-timeline.kql) |
+| 6 Persistence | [`bec-persistence.kql`](../queries/bec-persistence.kql) |
+| 7 Scope | [`bec-scope.kql`](../queries/bec-scope.kql) |
+
+**Before you run anything:** set `InternalDomains` in `bec.kql` and `bec-scope.kql` to your accepted domains. It ships as `contoso.com`; left as is, every internal forward counts as external.
 
 ---
 
-## What you are looking at
+## How the attack works
 
-BEC is a fraud, not a malware incident. There is usually no payload at all.
-The attacker gets into a mailbox, reads it until they understand how the
-business pays people, then either redirects an existing payment or starts a new
-one from a thread the recipient already trusts.
+- No malware. The attacker gets into a mailbox, reads it until they understand how the business pays, then redirects a payment from a thread the recipient already trusts.
+- Shapes: **invoice redirect** (hijacked supplier thread), **CEO fraud**, **payroll diversion**, **onward phishing** from the mailbox.
+- **The defining artefact is the mailbox rule** — it hides the replies from the owner. A rule moving "invoice" mail to RSS Feeds and marking it read has no innocent form.
+- Victims usually notice nothing until a supplier chases an invoice they already paid.
 
-The four shapes, in rough order of how often they show up:
+## Attack timeline
 
-- **Invoice redirect** — an existing supplier thread is hijacked and new bank
-  details are sent from the real mailbox.
-- **CEO fraud** — an urgent request to an individual in finance, usually
-  impersonating a director by display name.
-- **Payroll diversion** — an HR mailbox asked to change an employee's bank
-  details.
-- **Onward phishing** — the mailbox is used to phish its own contacts, because
-  mail from a known sender gets read.
-
-**The defining artefact is the mailbox rule.** Not because the rule causes
-damage, but because the attacker needs the real owner not to see the replies.
-A rule that moves anything containing "invoice" to RSS Feeds and marks it read
-is not a configuration mistake. Nobody does that by accident.
-
-The second artefact is silence. The victim often notices nothing at all until a
-supplier calls about an unpaid invoice they already paid.
-
----
-
-## The attack timeline
-
-| When | Attacker action | Telemetry | Table |
+| When | Attacker | Telemetry | Table |
 |---|---|---|---|
-| T−days | Credentials obtained — phish, infostealer, token theft, password reuse | Sign-in from a new address, or nothing at all | `SigninLogs` |
-| T+0 | First access to the mailbox | Sign-in, often with no MFA prompt if a token was stolen | `SigninLogs`, non-interactive |
-| T+min–hrs | **Reading and searching the mailbox** | `MailItemsAccessed`, `SearchQueryInitiatedExchange` | `OfficeActivity` |
-| T+hrs | **Rule created** to hide replies from the owner | `New-InboxRule`, `Set-InboxRule` | `OfficeActivity` |
-| T+hrs | Forwarding or delegation added | `Set-Mailbox`, `Add-MailboxPermission` | `OfficeActivity` |
-| T+hrs–days | Thread hijacked; fraudulent mail sent from the real mailbox | Outbound mail, often to a first-contact recipient | `EmailEvents` |
-| T+days | Replies land in the hiding folder; owner sees nothing | — | — |
-| T+days–weeks | Payment made. Discovery is usually external | — | — |
+| T−days | Gets credentials or a token | New sign-in address, or nothing | `SigninLogs` |
+| T+0 | First access | Sign-in, often token-based with no MFA prompt | `SigninLogs`, non-interactive |
+| T+min–hrs | **Reads and searches the mailbox** | `MailItemsAccessed`, `SearchQueryInitiatedExchange` | `OfficeActivity` |
+| T+hrs | **Creates a rule** to hide replies | `New-InboxRule`, `Set-InboxRule` | `OfficeActivity` |
+| T+hrs | Adds forwarding or delegation | `Set-Mailbox`, `Add-MailboxPermission` | `OfficeActivity` |
+| T+hrs–days | Sends the fraud from the real mailbox | Outbound mail, often first contact | `EmailEvents` |
+| T+days–weeks | Payment made; discovered externally | — | — |
 
-**The step that matters most is the reading.** `MailItemsAccessed` volume tells
-you what the attacker learned, and that determines your disclosure position —
-not the rule, and not the fraudulent mail.
+What they **read** sets your disclosure position — not the rule.
 
 ---
 
-## Investigation timeline
+## Steps
 
-### Phase 0 — Confirm · 5 minutes
+### 1. Confirm · 5 min
 
-Run **`bec.kql`**. Leave the `CHECK` fields blank to sweep, or set
-`UserIdentityCheck` if you have a name.
+**Run** `bec.kql`. Blank to sweep, or set `UserIdentityCheck`.
 
-Read `ExternalForward`, `HidingRule` and `ThirdParty` first.
+**Read first:** `ExternalForward`, `HidingRule`, `ThirdParty`.
 
-| Signal | `BecScore` | Verdict |
+| Signal | Score | Decide |
 |---|---|---|
-| `ExternalForward` true | any | **Treat as compromise.** Mail is leaving the tenant. Go to Phase 1 now. |
-| `HidingRule` and `FinanceRule` | any | **Treat as compromise.** This is the invoice-fraud rule and it has no benign form. |
-| `ThirdParty` true | ≥ 5 | **Probable.** Somebody other than the owner changed this mailbox. |
-| neither | ≥ 6 | Suspicious. Work it. |
-| neither | ≤ 3 | Usually a user doing something ordinary badly. Note and close. |
+| `ExternalForward` | any | **Compromise.** Mail is leaving the tenant. Go to step 2. |
+| `HidingRule` + `FinanceRule` | any | **Compromise.** The invoice-fraud rule. |
+| `ThirdParty` | 5+ | Probable. Someone other than the owner changed the mailbox. |
+| neither | 6+ | Suspicious. Work it. |
+| neither | 3 or less | Usually ordinary inbox management. Note and close. |
 
-The score is built from seven indicators:
+Score — 7 indicators, 15 maximum:
 
 | Weight | Indicator |
 |---|---|
-| +3 | `ExternalForward` — forwarding target outside `InternalDomains` |
-| +3 | `HidingRule` — moves to a hiding folder, deletes, or marks read |
-| +2 | `FinanceRule` — rule keywords match invoice, payment, bank, payroll |
-| +2 | `ThirdParty` — the actor is not the mailbox owner |
-| +2 | `NoSignInFromIP` — no successful sign-in from the address that made the change |
-| +2 | `OutboundSpike` — outbound volume more than triple the baseline |
+| +3 | `ExternalForward` — forward target with an `@` outside `InternalDomains` |
+| +3 | `HidingRule` — moves to a hiding folder, deletes, or marks read on keyword match |
+| +2 | `FinanceRule` — rule words match invoice, payment, bank, payroll |
+| +2 | `ThirdParty` — actor is not the mailbox owner |
+| +2 | `NoSignInFromIP` — no successful sign-in in 90 days from the address that made the change |
+| +2 | `OutboundSpike` — busiest day in the window above 3× the daily average before it |
 | +1 | `Delegation` — mailbox or folder permission granted |
 
-Record the `EventTime` of the highest-scoring row as your **pivot time**.
+Record `EventTime` as the **pivot time**.
 
-> `InternalDomains` at the top of the query is `contoso.com` — **change it to
-> your own accepted domains before you trust `ExternalForward`.** Left as it
-> ships, every internal forward reads as external.
+### 2. Reconstruct · 20 min
 
-### Phase 1 — Reconstruct · 20 minutes
-
-Run **`bec-timeline.kql`** with `PivotTime` from Phase 0. `AfterWindow`
-defaults to 7d because BEC plays out over days, not minutes.
+**Run** `bec-timeline.kql` with `PivotTime`. `AfterWindow` is 7 days because BEC plays out over days.
 
 ```
 1-Access          sign-ins, interactive and token
-2-Recon           mail read and searched — what they learned
+2-Recon           mail read and searched
 3-Mailbox change  the rule, the forward, the delegation
-4-Outbound        what was sent, and to whom
-5-Inbound         the thread being hijacked, and the replies
+4-Outbound        mail sent, and Send / SendAs / SendOnBehalf
+5-Inbound         the hijacked thread and the replies
 6-Directory       MFA, consent, roles
-7-Files           SharePoint and OneDrive, where invoices also live
+7-Files           SharePoint and OneDrive
 ```
 
-Work `3-Mailbox change` back to `1-Access` to establish how they got in, then
-forward into `4-Outbound` to establish what they did with it.
+Work back from `3-Mailbox change` to `1-Access` (how), then forward into `4-Outbound` (what they did).
 
-### Phase 2 — How they got in
+### 3. How they got in
 
-From `1-Access`, find the first session that is not the user's. Compare the
-address and ASN against the account's normal.
+- In `1-Access`, find the first session that is not the user's. Compare address and ASN to normal with [`signinlogs.kql`](../queries/signinlogs.kql).
+- **No odd sign-in at all** usually means a stolen token — see the [device code playbook](devicecode-playbook.md).
+- "Not yet established" is an acceptable finding. "No compromise" is not.
 
-If there is no anomalous sign-in at all, the access was probably token-based.
-Go to [`devicecode-playbook.md`](devicecode-playbook.md) and run
-[`signinlogs.kql`](../queries/signinlogs.kql) for the account — a token used
-from another network produces no failed sign-in and no risk detection.
+### 4. What they read · the disclosure question
 
-A BEC with no explicable sign-in is not a BEC with no compromise. It is a BEC
-where you have not found the compromise yet.
+- `2-Recon` rows are what legal and privacy will ask about.
+- **Check mailbox auditing is on before trusting an empty result.** `MailItemsAccessed` needs the right licence and auditing. This is the most common way BEC under-reports.
+- Volume matters: four messages = one targeted payment. Searches and thousands of binds = the whole mailbox.
 
-### Phase 3 — What they read · the disclosure question
+### 5. What they sent
 
-The `2-Recon` rows are the ones your legal and privacy people will ask about.
+- From `4-Outbound`, list every message in the window, especially to first-contact recipients.
+- **Phone** each recipient organisation. Do not email — the thread is compromised.
+- Read `5-Inbound` to find which payment was targeted and whether it has gone.
 
-`MailItemsAccessed` is only logged with the right licensing and mailbox
-auditing enabled. **Check whether it is on before you read an empty result as
-good news** — this is the single most common way a BEC investigation
-under-reports.
+### 6. What is still set · the revocation decision
 
-Volume matters more than content here. An attacker who read four messages
-targeted one payment. An attacker who ran searches and bound thousands of items
-took the mailbox.
-
-### Phase 4 — What they sent
-
-From `4-Outbound`, list every message sent during the window, especially to
-`IsFirstContact` recipients — a first-ever exchange with an external party,
-from a mailbox under someone else's control, is the fraud attempt itself.
-
-For each one, get the recipient organisation on the phone. Do not email them:
-the thread is compromised and the attacker may still be reading it.
-
-`5-Inbound` shows the thread they hijacked. Read it to work out which payment
-was targeted and whether it has already gone out.
-
-### Phase 5 — What is still set · the revocation decision
-
-Run **`bec-persistence.kql`**.
+**Run** `bec-persistence.kql`.
 
 ```
 Mailbox-Rule    inbox rules, including disabled ones
-Forwarding      Set-Mailbox forwarding, auto-reply
-Delegation      mailbox and folder permissions, send-as, send-on-behalf
-Transport-Rule  tenant-wide mail flow rules
+Forwarding      Set-Mailbox forwarding, auto-replies
+Delegation      mailbox and folder permissions
+Transport-Rule  tenant-wide mail flow rules — always returned
 Directory       MFA methods, consent, roles, registered devices
 ```
 
-**`Transport-Rule` is the one that catches people out.** It is tenant-wide, it
-is invisible from the mailbox, and it survives deleting the mailbox rules,
-resetting the password and revoking sessions. Check it even when the mailbox
-looks clean.
+**Transport rules** are tenant-wide, invisible from the mailbox, and survive the rule clean-up, password reset and session revocation. The query always returns them, whatever user you filter on.
 
-### Phase 6 — Scope · who else
+### 7. Scope
 
-Run **`bec-scope.kql`** with `ForwardTargetCheck`, `IPCheck`, `SubjectCheck` or
-`SenderCheck`.
-
-Results are tagged by how they matched:
+**Run** `bec-scope.kql` with `ForwardTargetCheck`, `IPCheck`, `SubjectCheck` or `SenderCheck`.
 
 ```
 Forward         another mailbox forwarding to the same target
 MailboxChange   another mailbox changed from the same address
-MailRecipient   everyone who received the thread, inside or outside
-SignIn          other accounts signed into from the same address
+MailRecipient   everyone who received the thread
+SignIn          other accounts signed in from the same address
 ```
 
-The `External` column separates the outside parties on `MailRecipient` rows,
-and those are the people who need a phone call.
+`External` is set on `MailRecipient` rows only. Those are the outside parties to phone.
 
 ---
 
-## Containment
+## Contain
 
-1. **Revoke sessions**, then reset the password. A reset alone leaves stolen
-   tokens working.
-2. **Remove the rules, forwarding and delegation** — and check for disabled
-   rules, which are trivially re-enabled.
-3. **Check tenant-wide transport rules.** Separate system, separate place.
-4. **Review MFA methods, app consents and registered devices** for anything
-   added since the pivot.
-5. **Warn the recipients by telephone.** Not by email.
-6. **Tell finance to halt the payment** before anything else if one is in
-   flight — this is the only step with a deadline.
-7. **Preserve the mailbox** before remediating if fraud has occurred. It is
-   evidence and there may be a police report or an insurance claim.
+1. **If a payment is in flight, tell finance to stop it.** This is the only step with a deadline.
+2. Revoke sessions, then reset the password.
+3. Remove rules (including disabled ones), forwarding and delegation.
+4. Remove any transport rule the attacker created.
+5. Remove MFA methods, consents and devices added since the pivot.
+6. Phone the recipients.
+7. Preserve the mailbox before clean-up if fraud occurred — police and insurers will want it.
 
----
+## Ticket
 
-## For the ticket
-
-- Pivot time and the rule definition in full
-- How they got in, or an explicit statement that it is not yet established
-- `MailItemsAccessed` volume, or a note that mailbox auditing was off
-- Every outbound message sent during the window, and its recipients
-- Whether a payment was attempted, its value, and whether it was stopped
+- Pivot time and the full rule definition
+- How they got in, or "not yet established"
+- `MailItemsAccessed` volume, or a note that auditing was off
+- Every outbound message in the window, with recipients
+- Payment attempted? Value? Stopped?
 - Persistence found, including transport rules
-- Who was warned, when, and by what channel
+- Who was warned, when, by what channel
 
----
+## False positives
 
-## Common false positives
-
-| Looks like BEC | Actually |
+| Looks like BEC | Usually |
 |---|---|
-| Forward to a personal address | A user breaking policy, not an attacker. Still a finding |
-| Rule moving mail to a folder | Ordinary inbox management — unless it also hides or deletes |
-| Delegation to a colleague | A PA or a shared mailbox arrangement |
-| Outbound spike | A mail merge, a newsletter, a genuinely busy week |
-| Third-party mailbox change | Helpdesk or a migration tool. Check the actor |
+| Forward to a personal address | A policy breach, not an attacker — still a finding |
+| Rule moving mail to a folder | Inbox management, unless it also hides or deletes |
+| Delegation to a colleague | A PA or shared-mailbox arrangement |
+| Outbound spike | Mail merge, newsletter, busy week |
+| Third-party mailbox change | Helpdesk or migration tool — check the actor |
 
-`ThirdParty` plus `NoSignInFromIP` is the combination worth trusting. Either on
-its own has an innocent explanation.
+`ThirdParty` + `NoSignInFromIP` together is the combination to trust.
 
----
+## Limits
 
-## What none of this proves
-
-- **An empty `2-Recon` does not mean nothing was read.** It usually means
-  mailbox auditing was not enabled.
-- **A clean mailbox does not mean a clean tenant.** Transport rules live
-  elsewhere.
-- **Removing the rule does not end the incident.** If the access route is still
-  open the rule comes back.
-- **No fraudulent mail found does not mean no fraud.** The attacker may have
-  been reading and waiting for the right invoice.
-
-None of these queries have been run against live telemetry — they are reviewed
-for KQL correctness and schema accuracy only. Test them in your own tenant.
+- An empty `2-Recon` usually means auditing was off, not that nothing was read.
+- A clean mailbox does not mean a clean tenant — transport rules live elsewhere.
+- Removing the rule does not end it if the access route is still open.
+- Rules created in Outlook appear as `UpdateInboxRules` and may not carry the parameters `bec.kql` scores. Read those rows by hand.
+- Not run against live telemetry. Reviewed for KQL correctness and schema only.

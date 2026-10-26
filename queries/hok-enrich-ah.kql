@@ -1,9 +1,7 @@
 //Hands-on-keyboard enrichment query — ADVANCED HUNTING ONLY
 //
-// Runs in the Defender portal (Hunting > Advanced hunting), not in Sentinel Logs.
-// FileProfile() is an Advanced Hunting function, and the time column here is Timestamp.
-// Every file the device ran or wrote in the window, with Microsoft's global view of it:
-// how many machines in the world have it, when the world first saw it, and who signed it.
+// Defender portal only (FileProfile() is not in Sentinel); time column is Timestamp.
+// Every file the device ran or wrote, with global prevalence, first seen and signer.
 let IncidentStart = ago(1d);              // first known attacker activity, e.g. datetime(2026-10-05T14:32:00Z)
 let IncidentEnd = now();
 let LookBefore = 1d;
@@ -18,7 +16,7 @@ union
     (DeviceFileEvents | where Timestamp between (StartTime .. IncidentEnd) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileRenamed") | where isnotempty(SHA1) and FileName matches regex ToolTypes | project SHA1, FileName, FolderPath, Seen = Timestamp, How = "written")
 | summarize FirstSeen = min(Seen), LastSeen = max(Seen), Names = make_set(FileName, 5), Paths = make_set(FolderPath, 5), How = make_set(How, 2) by SHA1
 | extend InStaging = tostring(Paths) has_any (StagePaths)
-// FileProfile enriches the first 1,000 rows only, so put the likeliest first.
+// FileProfile enriches the first 1,000 rows only, so the likeliest go first.
 | sort by InStaging desc, FirstSeen asc
 | invoke FileProfile("SHA1", 1000)
 | extend RareInWorld = isnull(GlobalPrevalence) or GlobalPrevalence < 500, NewToWorld = GlobalFirstSeen > ago(30d), NotValidlySigned = SignatureState != "SignedValid"
@@ -28,7 +26,7 @@ union
 //| where RareInWorld and NotValidlySigned                 // unsigned and almost nowhere else on earth — read these first
 //| where isnotempty(ThreatName)                          // Microsoft already has a name for it
 //
-// Other Advanced Hunting functions that save time on this kind of incident:
+// Other Advanced Hunting functions for this incident type:
 //   DeviceFromIP()          which device held an internal address at a given moment
 //     DeviceLogonEvents | where Timestamp > ago(1d) | where DeviceName contains DeviceCheck | where RemoteIPType == "Private" | project IP = RemoteIP | distinct IP | invoke DeviceFromIP()
 //   AssignedIPAddresses()   which addresses this device held at a given moment

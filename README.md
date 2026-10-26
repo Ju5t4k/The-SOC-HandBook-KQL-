@@ -14,25 +14,17 @@ docs/       playbooks and reference
 
 ### Playbooks
 
-- [ClickFix — end-to-end investigation](docs/clickfix-playbook.md) — attack
-  timeline, the six surfaces a victim can be told to paste into, ten
-  investigation phases with the query for each, containment order, and what an
-  empty result does not prove.
-- [Device code authentication — end-to-end investigation](docs/devicecode-playbook.md)
-  — attack timeline, six investigation phases with the query for each,
-  containment order, and why revoking sessions matters more than resetting the
-  password.
-- [Business email compromise — end-to-end investigation](docs/bec-playbook.md)
-  — attack timeline, seven investigation phases, containment order, and why the
-  tenant-wide transport rule is the one that gets missed.
-- [Malicious attachment — end-to-end investigation](docs/attachment-playbook.md)
-  — attack timeline, six investigation phases, and the `SHA256` join that turns
-  a mail hygiene problem into an endpoint incident.
-- [Hands-on-keyboard intrusion — end-to-end investigation](docs/hok-playbook.md)
-  — for new and experienced analysts: twelve phases from "is someone still
-  here" to the root cause analysis, connections before, during and after,
-  IOC and IOA collection, and how to collect from the Defender portal without
-  a query.
+- [ClickFix](docs/clickfix-playbook.md) — fake-CAPTCHA paste-and-run. Eight
+  steps from the paste to the reimage decision.
+- [Device code phishing](docs/devicecode-playbook.md) — OAuth device code
+  token theft. Six steps; revoking sessions matters more than the password.
+- [Business email compromise](docs/bec-playbook.md) — mailbox takeover and
+  invoice fraud. Seven steps; check tenant-wide transport rules.
+- [Malicious attachment](docs/attachment-playbook.md) — the `SHA256` join from
+  mail to endpoint. Six steps.
+- [Hands-on-keyboard intrusion](docs/hok-playbook.md) — a person operating on
+  a device. Twelve steps from "are they still here" to root cause, plus
+  collection from the Defender portal without a query.
 
 ## Using these
 

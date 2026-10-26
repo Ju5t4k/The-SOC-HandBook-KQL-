@@ -1,24 +1,26 @@
 //BEC scope query
 //
-// Who else. Fill in one indicator from bec.kql and run.
+// Who else. Fill in one indicator from bec.kql.
 let TimeToCheck = 30d;
 let ForwardTargetCheck = "";
 let SubjectCheck = "";
 let SenderCheck = "";
 let IPCheck = "";
 //
+// CHANGE THIS — every accepted domain.
 let InternalDomains = dynamic(["contoso.com","contoso.onmicrosoft.com"]);
 //
 union isfuzzy=true
-    // Other mailboxes configured to forward to the same place.
+    // Other mailboxes forwarding to the same place.
     (OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where OfficeWorkload =~ "Exchange" | where isnotempty(ForwardTargetCheck) and Parameters contains ForwardTargetCheck | extend Hit = "Forward", Actor = UserId, Party = MailboxOwnerUPN, Evidence = strcat(Operation, " | ", Parameters)),
     // Other mailbox changes from the same address.
     (OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where OfficeWorkload =~ "Exchange" | where isnotempty(IPCheck) and ClientIP contains IPCheck | extend Hit = "MailboxChange", Actor = UserId, Party = MailboxOwnerUPN, Evidence = strcat(Operation, " | ", ClientIP, " | ", Parameters)),
     // Everyone who received the fraudulent thread.
     (EmailEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(SubjectCheck) and Subject contains SubjectCheck) or (isnotempty(SenderCheck) and SenderFromAddress contains SenderCheck) | extend Hit = "MailRecipient", Actor = SenderFromAddress, Party = RecipientEmailAddress, Evidence = strcat(EmailDirection, " | ", Subject, " | ", DeliveryAction, "/", DeliveryLocation, " | firstContact=", tostring(IsFirstContact), " | ", NetworkMessageId)),
-    // Sign-ins from the same address, in case the mailbox is not the only one.
+    // Other accounts signing in from the same address.
     (SigninLogs | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(IPCheck) and IPAddress contains IPCheck | extend Hit = "SignIn", Actor = UserPrincipalName, Party = AppDisplayName, Evidence = strcat(ResultType, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion)))
-| extend External = not(Party has_any (InternalDomains))
+// External only means something for mail recipients.
+| extend External = Hit == "MailRecipient" and not(Party has_any (InternalDomains))
 | project-rename EventTime = TimeGenerated
 | project EventTime, Hit, Actor, Party, External, Evidence
 | sort by EventTime asc

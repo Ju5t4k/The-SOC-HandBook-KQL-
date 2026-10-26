@@ -1,7 +1,6 @@
 //Hands-on-keyboard file usage query
 //
-// What was opened, dropped, packed, changed over the network, deleted, renamed, copied
-// to removable media and pulled from SharePoint or OneDrive.
+// Files opened, dropped, archived, changed over SMB, deleted, renamed, labelled, copied to USB, and SharePoint/OneDrive activity.
 let IncidentStart = ago(1d);              // first known attacker activity, e.g. datetime(2026-10-05T14:32:00Z)
 let IncidentEnd = now();
 let LookBefore = 1d;
@@ -18,25 +17,25 @@ let ToolTypes = @"(?i)\.(exe|dll|sys|ps1|psm1|bat|cmd|vbs|js|hta|msi|py|jar)$";
 let ArchiveTypes = @"(?i)\.(zip|7z|rar|tar|gz|tgz|cab|iso|vhd|vhdx)$";
 //
 union isfuzzy=true
-    // Windows writes a shortcut into Recent when a user opens a file. A new or updated one means it was opened.
+    // A shortcut written to Recent means the file was opened. Absence proves nothing.
     (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where FolderPath has @"\Microsoft\Windows\Recent\" and FileName endswith ".lnk" | where ActionType in~ ("FileCreated","FileModified") | extend Usage = "Opened", Actor = InitiatingProcessAccountName, FileName = replace_regex(FileName, @"(?i)\.lnk$", ""), By = InitiatingProcessFileName, Detail = iff(ActionType =~ "FileCreated", "first open", "opened again")),
-    // Tools and scripts landing in the folders operators use to stage their kit.
+    // Tools and scripts written to staging folders.
     (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileRenamed") | where FolderPath has_any (StagePaths) | where FileName matches regex ToolTypes | extend Usage = "Dropped", Actor = InitiatingProcessAccountName, By = InitiatingProcessFileName, Detail = strcat("origin=", FileOriginUrl, " | ", InitiatingProcessCommandLine)),
-    // Archives. Collected data is almost always packed before it leaves.
+    // Archives written.
     (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileRenamed","FileModified") | where FileName matches regex ArchiveTypes | where InitiatingProcessFileName !in~ ("msiexec.exe","TrustedInstaller.exe","MsMpEng.exe","svchost.exe") | extend Usage = "Archive written", Actor = InitiatingProcessAccountName, By = InitiatingProcessFileName, Detail = InitiatingProcessCommandLine),
-    // Files changed on this device by another machine over SMB. On a file server, this is the collection.
+    // Files changed on this device by another machine over SMB.
     (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where isnotempty(RequestSourceIP) or RequestProtocol in~ ("SMB","NFS") | extend Usage = strcat("Changed over ", RequestProtocol), Actor = strcat(RequestAccountDomain, "\\", RequestAccountName), By = strcat("from ", RequestSourceIP), Detail = strcat(ActionType, " in share ", ShareName)),
-    // Deleted by a shell or a LOLBin, or deleted out of a staging folder. Cleanup after themselves.
+    // Deleted by a shell or LOLBin, or from a staging folder.
     (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType =~ "FileDeleted" | where InitiatingProcessFileName in~ (Shells) or FolderPath has_any (StagePaths) | extend Usage = "Deleted", Actor = InitiatingProcessAccountName, By = InitiatingProcessFileName, Detail = InitiatingProcessCommandLine),
-    // A file whose extension changed on rename. Masquerading, or encryption one file at a time.
+    // Extension changed on rename: masquerading or encryption.
     (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType =~ "FileRenamed" | extend NewExt = tolower(extract(@"\.([^.\\]+)$", 1, FileName)), OldExt = tolower(extract(@"\.([^.\\]+)$", 1, PreviousFileName)) | where isnotempty(OldExt) and NewExt != OldExt | extend Usage = "Extension changed", Actor = InitiatingProcessAccountName, By = InitiatingProcessFileName, Detail = strcat("was ", PreviousFileName)),
-    // Anything carrying a sensitivity label. If it was touched in the window, it is in scope for disclosure.
+    // Files with a sensitivity label. Touched in the window = in disclosure scope.
     (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where isnotempty(SensitivityLabel) or IsAzureInfoProtectionApplied == true | extend Usage = "Labelled file", Actor = InitiatingProcessAccountName, By = InitiatingProcessFileName, Detail = strcat(ActionType, " | label=", SensitivityLabel, " ", SensitivitySubLabel)),
-    // Written to a drive other than C:. Often removable media; sometimes a second fixed disk.
+    // Written to a drive other than C: (often USB).
     (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where FolderPath matches regex @"(?i)^[d-z]:\\" | extend Usage = "Written to another drive", Actor = InitiatingProcessAccountName, By = InitiatingProcessFileName, Detail = ActionType),
-    // Storage devices plugged in, and what device control recorded about them.
+    // Storage plugged in, and device control events.
     (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where DeviceName contains DeviceCheck | where ActionType in~ ("UsbDriveMount","UsbDriveMounted","UsbDriveDriveLetterChanged","RemovableStoragePolicyTriggered","RemovableStorageFileEvent") or (ActionType =~ "PnpDeviceConnected" and tostring(AdditionalFields) has_any ("USBSTOR","WPD","Disk")) | extend Usage = "Removable media", Actor = iff(isnotempty(InitiatingProcessAccountName), InitiatingProcessAccountName, AccountName), By = InitiatingProcessFileName, Detail = strcat(ActionType, " | ", tostring(AdditionalFields))),
-    // SharePoint and OneDrive. The account's cloud files, wherever the session came from.
+    // SharePoint and OneDrive file activity by the account.
     (CloudAppEvents | where TimeGenerated between (StartTime .. EndTime) | where isnotempty(UserIdentityCheck) | where Application has_any ("SharePoint","OneDrive") | where ActionType in~ ("FileDownloaded","FileAccessed","FileUploaded","FileSyncDownloadedFull","FileSyncUploadedFull","FileCopied","FileMoved","FileDeleted","FileRenamed","FilePreviewed") | extend Actor = iff(isnotempty(tostring(RawEventData.UserId)), tostring(RawEventData.UserId), AccountDisplayName) | where Actor contains UserIdentityCheck | extend Usage = strcat("Cloud ", ActionType), DeviceName = "", FileName = tostring(RawEventData.SourceFileName), FolderPath = ObjectName, SHA256 = "", FileSize = long(null), By = strcat(IPAddress, " ", ISP), Detail = UserAgent)
 | where Actor contains UserIdentityCheck
 | where FileName contains FileCheck or FolderPath contains FileCheck

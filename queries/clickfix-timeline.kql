@@ -1,6 +1,6 @@
 //ClickFix timeline query
 //
-// Set PivotTime to the moment of the paste (EventTime from clickfix.kql).
+// The ClickFix incident in order. Set PivotTime to EventTime from clickfix.kql.
 let PivotTime = now();
 let BeforeWindow = 2h;
 let AfterWindow = 24h;
@@ -11,38 +11,38 @@ let StartTime = PivotTime - BeforeWindow;
 let EndTime = PivotTime + AfterWindow;
 let Browsers = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe","opera.exe","iexplore.exe"]);
 let LolBins = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe","forfiles.exe","schtasks.exe","sc.exe","reg.exe"]);
+let UserPaths = dynamic([@"\appdata\",@"\temp\",@"\programdata\",@"\users\public\",@"\downloads\"]);
 let DefenceActions = dynamic(["AntivirusDetection","AntivirusReport","TamperingAttempt","ExploitGuardNetworkProtectionBlocked","SecurityControlConfigurationChange","AntivirusConfigurationChange","AsrLsassCredentialTheftBlocked","AntivirusScanCancelled"]);
 //
 union isfuzzy=true
-    // PHASE 1 — the lure. The page the command was copied from.
+    // 1 — the page the command was copied from.
     (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType == "BrowserLaunchedToOpenUrl" | where isnotempty(RemoteUrl) | extend Phase = "1-Lure", Source = "DeviceEvents", Actor = AccountName, Detail = strcat("browser opened: ", RemoteUrl, " | ", InitiatingProcessFileName)),
     (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where InitiatingProcessFileName in~ (Browsers) | where isnotempty(RemoteUrl) | extend Phase = "1-Lure", Source = "DeviceNetworkEvents", Actor = InitiatingProcessAccountName, Detail = strcat("browser traffic: ", RemoteUrl, " (", RemoteIP, ":", tostring(RemotePort), ")")),
-    // The lure can arrive by mail or Teams rather than by browsing. This is where that shows.
+    // A lure that arrived by mail or Teams.
     (UrlClickEvents | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "1-Lure", Source = "UrlClickEvents", DeviceName = "", Actor = AccountUpn, Detail = strcat("Safe Links click from ", Workload, ": ", Url, " | verdict=", ThreatTypes, " | ", ActionType, iff(IsClickedThrough, " | clicked through the warning", ""))),
-    // PHASE 2 — the paste. RunMRU proves the Run dialog; TypedPaths proves the Explorer address bar.
+    // 2 — the paste. RunMRU = Win+R, TypedPaths = Explorer address bar.
     (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where RegistryKey has @"Explorer\RunMRU" or RegistryKey has @"Explorer\TypedPaths" | where isnotempty(RegistryValueData) | extend Phase = "2-Paste", Source = "DeviceRegistryEvents", Actor = InitiatingProcessAccountName, Detail = strcat(iff(RegistryKey has "RunMRU", "Win+R", "Explorer address bar"), " [", RegistryValueName, "] = ", RegistryValueData)),
-    // A console opened by the desktop with no arguments. The paste happened inside the window,
-    // so no command line exists — script block logging is the only record of what was typed.
+    // Commands pasted into an open console. Needs script block logging.
     (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType == "PowerShellCommand" | extend Phase = "2-Paste", Source = "DeviceEvents", Actor = AccountName, Detail = strcat("console command: ", tostring(todynamic(AdditionalFields).Command))),
-    // PHASE 3 — execution.
+    // 3 — what the desktop and the LOLBins ran.
     (DeviceProcessEvents | where TimeGenerated between (StartTime .. EndTime) | where FileName in~ (LolBins) or InitiatingProcessFileName =~ "explorer.exe" | extend Phase = "3-Execution", Source = "DeviceProcessEvents", Actor = AccountName, Detail = strcat(InitiatingProcessFileName, " -> ", FileName, " | ", ProcessCommandLine)),
-    // PHASE 4 — payload fetch. Traffic from something other than a browser.
-    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where InitiatingProcessFileName !in~ (Browsers) | where RemoteIPType == "Public" | extend Phase = "4-Download", Source = "DeviceNetworkEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " -> ", iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), ":", tostring(RemotePort))),
-    // PHASE 5 — written to disk. FileOriginUrl says where the file came from.
-    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | extend Phase = "5-Disk", Source = "DeviceFileEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " wrote ", FolderPath, " | SHA256=", SHA256, " | origin=", FileOriginUrl)),
-    // PHASE 6 — persistence.
+    // 4 — downloads by a LOLBin, or by something running from a user-writable folder.
+    (DeviceNetworkEvents | where TimeGenerated between (StartTime .. EndTime) | where InitiatingProcessFileName in~ (LolBins) or InitiatingProcessFolderPath has_any (UserPaths) | where RemoteIPType == "Public" | extend Phase = "4-Download", Source = "DeviceNetworkEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " -> ", iff(isnotempty(RemoteUrl), RemoteUrl, RemoteIP), ":", tostring(RemotePort))),
+    // 5 — files from the web, and executables, scripts and archives written. FileOriginUrl is the source.
+    (DeviceFileEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType in~ ("FileCreated","FileModified","FileRenamed") | where isnotempty(FileOriginUrl) or FileName matches regex @"(?i)\.(exe|dll|ps1|bat|cmd|vbs|js|hta|msi|lnk|zip|7z|rar|iso)$" | extend Phase = "5-Disk", Source = "DeviceFileEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " wrote ", FolderPath, " | SHA256=", SHA256, " | origin=", FileOriginUrl)),
+    // 6 — autoruns written in the window.
     (DeviceRegistryEvents | where TimeGenerated between (StartTime .. EndTime) | where RegistryKey contains @"CurrentVersion\Run" or RegistryKey contains @"CurrentVersion\RunOnce" or RegistryKey contains "Winlogon" or RegistryKey contains "Image File Execution Options" or RegistryKey contains @"Policies\Explorer\Run" | extend Phase = "6-Persistence", Source = "DeviceRegistryEvents", Actor = InitiatingProcessAccountName, Detail = strcat(InitiatingProcessFileName, " set ", RegistryKey, "\\", RegistryValueName, " = ", RegistryValueData)),
-    // PHASE 7 — defensive reaction. Empty does not mean clean.
+    // 7 — what AV, ASR and tamper protection did. Empty proves nothing.
     (DeviceEvents | where TimeGenerated between (StartTime .. EndTime) | where ActionType in~ (DefenceActions) | extend Phase = "7-Defence", Source = "DeviceEvents", Actor = AccountName, Detail = strcat(ActionType, " | ", FileName, " | ", FolderPath)),
-    // PHASE 8 — identity. Token theft shows here, not on the endpoint.
+    // 8 — interactive sign-ins.
     (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "8-Identity", Source = "SigninLogs", DeviceName = tostring(DeviceDetail.displayName), Actor = UserPrincipalName, Detail = strcat("sign-in ", ResultType, " ", ResultDescription, " | ", IPAddress, " | ", tostring(LocationDetails.countryOrRegion), " | ", AppDisplayName)),
-    // Token replay does not look like a sign-in. It shows up here and nowhere else.
+    // Token replay is non-interactive. It only shows here.
     (AADNonInteractiveUserSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "8-Identity", Source = "AADNonInteractiveUserSignInLogs", DeviceName = tostring(todynamic(DeviceDetail).displayName), Actor = UserPrincipalName, Detail = strcat("token use ", ResultType, " | ", IPAddress, " | AS", AutonomousSystemNumber, " | ", tostring(todynamic(LocationDetails).countryOrRegion), " | ", AppDisplayName, " | ", IncomingTokenType)),
-    // What the stolen session was used to change: MFA methods, consent, roles, secrets.
-    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where OperationName has_any ("authentication method","consent","Add member to role","Add service principal","Add app role assignment","password","Register device","registered owner","Update user") | extend Phase = "8-Identity", Source = "AuditLogs", DeviceName = "", Actor = iff(isnotempty(tostring(InitiatedBy.user.userPrincipalName)), tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | target=", tostring(TargetResources[0].displayName))),
-    // PHASE 9 — cloud. Mailbox rules, downloads, sharing.
-    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "9-Cloud", Source = "OfficeActivity", DeviceName = "", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP))
-// Cloud events carry no device name — DeviceCheck must not cut them out.
+    // What the session changed: MFA methods, consent, roles, passwords.
+    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where OperationName has_any ("authentication method","consent","Add member to role","Add service principal","Add app role assignment","password","Register device","registered owner","Update user") | extend Phase = "8-Identity", Source = "AuditLogs", DeviceName = "", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | target=", tostring(TargetResources[0].displayName))),
+    // 9 — Microsoft 365 activity, mail reads left out.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation !in~ ("MailItemsAccessed") | extend Phase = "9-Cloud", Source = "OfficeActivity", DeviceName = "", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP))
+// Cloud rows have no device name, so DeviceCheck must not remove them.
 | where isempty(DeviceName) or DeviceName contains DeviceCheck
 | where Actor contains UserIdentityCheck
 | project-rename EventTime = TimeGenerated

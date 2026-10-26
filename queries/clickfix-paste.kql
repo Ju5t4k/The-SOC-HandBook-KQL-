@@ -1,7 +1,6 @@
 //ClickFix paste surface query
 //
-// Win+R is the only surface that writes RunMRU. Run this when clickfix.kql comes
-// back empty but the story still says ClickFix — it covers the other surfaces.
+// Every paste surface, not just Win+R. Run it when clickfix.kql is empty or weak.
 let TimeToCheck = 7d;
 let DeviceCheck = "";
 let UserIdentityCheck = "";
@@ -11,31 +10,29 @@ let LinkWindow = 2m;
 let Shells = dynamic(["powershell.exe","pwsh.exe","cmd.exe","wt.exe","WindowsTerminal.exe","openconsole.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe","msbuild.exe","installutil.exe","conhost.exe"]);
 let Browsers = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe","opera.exe","iexplore.exe","msedgewebview2.exe"]);
 let UnixShells = dynamic(["bash","zsh","sh","dash","osascript","curl","wget","python3","Terminal","iTerm2"]);
-// A Unix one-liner that fetches and runs in one breath. Plain curl on its own is not enough.
+// A Unix fetch-and-run one-liner. Plain curl alone does not count.
 let UnixPipeToShell = @"\|\s*(ba|z)?sh\b";
 let UnixLureWords = dynamic(["do shell script","base64 -d","base64 --decode","-fsSL","--output -"]);
 let DownloadWords = dynamic(["iex","invoke-expression","iwr","invoke-webrequest","invoke-restmethod","irm","downloadstring","downloadfile","webclient","curl","wget","bitstransfer","urlcache","frombase64string","do shell script"]);
 let StealthWords = dynamic(["hidden","windowstyle","bypass","noprofile","nop","encodedcommand","-enc ","noninteractive","unrestricted","-w h"]);
 //
-// The two paste surfaces that write readable text. Everything else writes binary or nothing.
+// The only two paste surfaces that leave readable text.
 let Pastes = DeviceRegistryEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(RegistryValueData) | where RegistryKey has @"Explorer\RunMRU" or RegistryKey has @"Explorer\TypedPaths" | extend PasteSurface = iff(RegistryKey has "RunMRU", "Win+R", "Explorer address bar") | project PsDeviceId = DeviceId, PasteTime = TimeGenerated, PasteSurface, PastedText = trim_end(@"\\1", RegistryValueData);
 let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, OSPlatform, DeviceType, OnboardingStatus, SensorHealthState;
 //
 union isfuzzy=true
-    // A shell or LOLBin started by the desktop or by a browser. Covers Win+R, the Explorer
-    // address bar, the file-open dialog and protocol-handler variants in one predicate.
+    // A shell or LOLBin started by the desktop or a browser: Win+R, address bar, file dialog, protocol handler.
     (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ (Shells) | where InitiatingProcessFileName =~ "explorer.exe" or InitiatingProcessFileName in~ (Browsers) or InitiatingProcessParentFileName =~ "explorer.exe" or InitiatingProcessParentFileName in~ (Browsers) | extend Source = "DeviceProcessEvents", Actor = AccountName, RanFile = FileName, RanCommand = ProcessCommandLine, ParentFile = InitiatingProcessFileName, GrandparentFile = InitiatingProcessParentFileName),
-    // Typed or pasted straight into an open console. There is no process command line for these
-    // at all. Needs PowerShell script block logging — empty here means logging is off, not clean.
+    // Pasted into an open console. No command line exists; needs script block logging.
     (DeviceEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType == "PowerShellCommand" | extend Source = "DeviceEvents", Actor = AccountName, RanFile = InitiatingProcessFileName, RanCommand = tostring(todynamic(AdditionalFields).Command), ParentFile = InitiatingProcessParentFileName, GrandparentFile = ""),
-    // macOS and Linux. "Paste this into Terminal" is the same attack with a different shell.
+    // macOS and Linux Terminal.
     (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where FileName in~ (UnixShells) | where ProcessCommandLine matches regex UnixPipeToShell or ProcessCommandLine has_any (UnixLureWords) | extend Source = "DeviceProcessEvents", Actor = AccountName, RanFile = FileName, RanCommand = ProcessCommandLine, ParentFile = InitiatingProcessFileName, GrandparentFile = InitiatingProcessParentFileName)
 | where DeviceName contains DeviceCheck
 | where Actor contains UserIdentityCheck
 | where RanCommand contains CommandCheck
 | project-rename EventTime = TimeGenerated
 | join kind=leftouter Pastes on $left.DeviceId == $right.PsDeviceId
-// Keep only a paste that came shortly before this execution, then keep the latest such paste.
+// Keep the latest paste within LinkWindow before this execution.
 | extend Linked = isnotempty(PasteTime) and PasteTime <= EventTime and PasteTime > (EventTime - LinkWindow)
 | extend PasteTime = iff(Linked, PasteTime, datetime(null)), PastedText = iff(Linked, PastedText, ""), PasteSurface = iff(Linked, PasteSurface, "")
 | extend PasteRank = coalesce(PasteTime, datetime(1601-01-01))

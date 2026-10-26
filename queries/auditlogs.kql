@@ -21,9 +21,7 @@ AuditLogs
 | extend Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)) | extend ActorIP = tostring(InitiatedBy.user.ipAddress) | extend ActorIsApp = isempty(tostring(InitiatedBy.user.userPrincipalName)) | extend ActorAppId = tostring(InitiatedBy.app.appId)
 | mv-expand TargetResources
 | extend Target = coalesce(tostring(TargetResources.userPrincipalName), tostring(TargetResources.displayName)) | extend TargetType = tostring(TargetResources.type) | extend TargetId = tostring(TargetResources.id)
-// mv-apply over an EMPTY array drops the row, and plenty of operations carry
-// no modifiedProperties at all. Substitute a one-element array so those events
-// survive with blank values rather than vanishing from the result.
+// Guard: mv-apply drops rows with an empty array, and many operations have no modifiedProperties.
 | extend PropList = iff(array_length(todynamic(TargetResources.modifiedProperties)) > 0, todynamic(TargetResources.modifiedProperties), dynamic([{}]))
 | mv-apply Prop = PropList on ( summarize ChangedProperties = make_set(tostring(Prop.displayName), 10), OldValues = make_set(trim(@'"', tostring(Prop.oldValue)), 10), NewValues = make_set(trim(@'"', tostring(Prop.newValue)), 10) )
 | extend ActorKey = tolower(Actor), TargetKey = tolower(Target)

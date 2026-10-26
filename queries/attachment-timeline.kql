@@ -1,39 +1,39 @@
 //Attachment timeline query
 //
-// Fill in the message id from attachment.kql, or the hash, or both.
+// Mail to endpoint in order. Fill in a message id, a hash or a recipient from attachment.kql.
 let TimeToCheck = 14d;
 let MessageCheck = "";
 let HashCheck = "";
 let RecipientCheck = "";
 //
-// Resolve whichever identifier was supplied into a set of message ids, so
-// every leg below can key off the same thing.
+// Whatever was supplied becomes a set of message ids, so every leg keys off the same thing.
 let MessageIds = union isfuzzy=true
     ( EmailEvents | where TimeGenerated >= ago(TimeToCheck) | where (isnotempty(MessageCheck) and NetworkMessageId contains MessageCheck) or (isnotempty(RecipientCheck) and RecipientEmailAddress contains RecipientCheck) | project NetworkMessageId ),
     ( EmailAttachmentInfo | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(HashCheck) and SHA256 =~ HashCheck | project NetworkMessageId )
     | distinct NetworkMessageId;
-// Hashes belonging to those messages, so the endpoint legs can follow the file.
+// The attachments' hashes, so the endpoint legs can follow the file.
 let Hashes = union isfuzzy=true
     ( EmailAttachmentInfo | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(SHA256) | join kind=inner MessageIds on NetworkMessageId | project SHA256 ),
     ( print SHA256 = HashCheck | where isnotempty(SHA256) )
     | distinct SHA256;
 //
 union isfuzzy=true
-    // PHASE 1 — delivery. Where the message ended up, not where it was sent.
+    // 1 — where the message ended up, not just where it was sent.
     (EmailEvents | where TimeGenerated >= ago(TimeToCheck) | join kind=inner MessageIds on NetworkMessageId | extend Phase = "1-Delivery", Source = "EmailEvents", Who = RecipientEmailAddress, Detail = strcat("from ", SenderFromAddress, " (", SenderIPv4, ") | ", Subject, " | ", DeliveryAction, "/", DeliveryLocation, " -> ", LatestDeliveryAction, "/", LatestDeliveryLocation, " | threats=", ThreatTypes, " | auth=", AuthenticationDetails)),
-    // PHASE 2 — the attachment itself.
+    // 2 — the attachment.
     (EmailAttachmentInfo | where TimeGenerated >= ago(TimeToCheck) | join kind=inner MessageIds on NetworkMessageId | extend Phase = "2-Attachment", Source = "EmailAttachmentInfo", Who = RecipientEmailAddress, Detail = strcat(FileName, " | ", FileType, "/", FileExtension, " | ", tostring(FileSize), " bytes | SHA256=", SHA256, " | threats=", ThreatTypes, " ", ThreatNames)),
-    // PHASE 3 — links in the same message. Attachments and links travel together.
+    // 3 — links in the same message.
     (EmailUrlInfo | where TimeGenerated >= ago(TimeToCheck) | join kind=inner MessageIds on NetworkMessageId | extend Phase = "3-Links", Source = "EmailUrlInfo", Who = "", Detail = strcat(UrlDomain, " | ", Url, " | in ", UrlLocation)),
-    // PHASE 4 — clicks. Safe Links only sees what it protects.
+    // 4 — Safe Links clicks.
     (UrlClickEvents | where TimeGenerated >= ago(TimeToCheck) | join kind=inner MessageIds on NetworkMessageId | extend Phase = "4-Click", Source = "UrlClickEvents", Who = AccountUpn, Detail = strcat(ActionType, " | ", Url, " | throughOverride=", tostring(IsClickedThrough), " | ", Workload, " | ", IPAddress)),
-    // PHASE 5 — what happened to the mail after delivery. ZAP lands here.
+    // 5 — after delivery: ZAP, admin release, user moves.
     (EmailPostDeliveryEvents | where TimeGenerated >= ago(TimeToCheck) | join kind=inner MessageIds on NetworkMessageId | extend Phase = "5-Post delivery", Source = "EmailPostDeliveryEvents", Who = RecipientEmailAddress, Detail = strcat(ActionType, " | ", Action, " -> ", ActionResult, " | trigger=", ActionTrigger, " | now in ", DeliveryLocation)),
-    // PHASE 6 — the file on an endpoint. FileOriginUrl shows how it arrived.
+    // 6 — the file on an endpoint.
     (DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | join kind=inner Hashes on SHA256 | extend Phase = "6-On disk", Source = "DeviceFileEvents", Who = DeviceName, Detail = strcat(ActionType, " | ", FolderPath, " | by ", InitiatingProcessFileName, " | origin=", FileOriginUrl)),
-    // PHASE 7 — it ran.
+    // 7 — the file ran.
     (DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | join kind=inner Hashes on SHA256 | extend Phase = "7-Executed", Source = "DeviceProcessEvents", Who = DeviceName, Detail = strcat(AccountName, " | ", InitiatingProcessFileName, " -> ", FileName, " | ", ProcessCommandLine))
-| where Who contains RecipientCheck or isempty(RecipientCheck)
+// The recipient filter applies to mail rows. Link and endpoint rows carry no recipient.
+| where isempty(RecipientCheck) or Phase in ("3-Links","6-On disk","7-Executed") or Who contains RecipientCheck
 | project-rename EventTime = TimeGenerated
 | project EventTime, Phase, Source, Who, Detail
 | sort by EventTime asc

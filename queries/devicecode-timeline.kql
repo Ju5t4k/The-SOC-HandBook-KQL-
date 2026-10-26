@@ -1,6 +1,6 @@
 //DeviceCode timeline query
 //
-// Set PivotTime to the device code sign-in time (EventTime from devicecode.kql).
+// The device code incident in order. Set PivotTime to EventTime from devicecode.kql.
 let PivotTime = now();
 let BeforeWindow = 4h;
 let AfterWindow = 48h;
@@ -8,33 +8,31 @@ let UserIdentityCheck = "";
 //
 let StartTime = PivotTime - BeforeWindow;
 let EndTime = PivotTime + AfterWindow;
-let DeviceOps = dynamic(["Add device","Update device","Add registered owner to device","Add registered users to device","Register device","Pre-create device","Add Windows Hello for Business credential","Add passwordless phone sign-in credential","Add Passkey (device-bound)","Add platform credential","Device no longer compliant","Device no longer managed"]);
+let DeviceOps = dynamic(["Add device","Register device","Add registered owner to device","Add registered users to device","Add Windows Hello for Business credential","Add passwordless phone sign-in credential","Add Passkey (device-bound)","Add platform credential"]);
 //
 union isfuzzy=true
-    // PHASE 1 — code delivery. Mail or Teams asking the user to enter a code.
-    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where OfficeWorkload in~ ("Exchange","MicrosoftTeams") | where Operation has_any ("MailItemsAccessed","Send","MessageSent","ChatCreated","MemberAdded") | extend Phase = "1-Delivery", Source = "OfficeActivity", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP)),
-    // PHASE 2 — code entry. The sign-in looks perfect: real user, real MFA,
-    // real address. Do not read the absence of an error as evidence.
-    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | extend Phase = "2-Code entry", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("deviceCode ", ResultType, " ", ResultDescription, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | MFA=", AuthenticationRequirement, " | CA=", ConditionalAccessStatus)),
-    // PHASE 3 — the user's other interactive sign-ins in the window.
-    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol !~ "deviceCode" | extend Phase = "3-Sign-ins", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("sign-in ", ResultType, " | ", AppDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | ", ClientAppUsed)),
-    // PHASE 4 — token use. The attacker shows here: same identity, different network.
-    (AADNonInteractiveUserSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "4-Token use", Source = "NonInteractive", Actor = UserPrincipalName, Detail = strcat(SignInEventTypes, " ", ResultType, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(todynamic(LocationDetails).countryOrRegion), " | token=", IncomingTokenType)),
-    // PHASE 5 — service principals. App consent grants access without the user.
+    // 1 — the phish that carried the code: inbound mail, and Teams chats from outside.
+    (EmailEvents | where TimeGenerated between (StartTime .. EndTime) | where EmailDirection == "Inbound" | extend Phase = "1-Delivery", Source = "EmailEvents", Actor = RecipientEmailAddress, Detail = strcat("from ", SenderFromAddress, " | ", Subject, " | urls=", tostring(UrlCount), " | ", DeliveryAction, "/", DeliveryLocation)),
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where OfficeWorkload =~ "MicrosoftTeams" | where Operation in~ ("ChatCreated","MemberAdded","MessageSent","MessageCreatedHasLink") | extend Phase = "1-Delivery", Source = "OfficeActivity", Actor = UserId, Detail = strcat(Operation, " | ", ResultStatus, " | ", ClientIP)),
+    // 2 — the device code sign-in. It looks clean: real user, real MFA, real address.
+    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | extend Phase = "2-Code entry", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("deviceCode ", ResultType, " ", ResultDescription, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | MFA=", AuthenticationRequirement, " | CA=", ConditionalAccessStatus, " | session=", SessionId)),
+    // 3 — the user's other interactive sign-ins.
+    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol !~ "deviceCode" and OriginalTransferMethod !~ "deviceCodeFlow" | extend Phase = "3-Sign-ins", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("sign-in ", ResultType, " | ", AppDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | ", ClientAppUsed)),
+    // 4 — token use. The attacker appears here: same user, different network. Match the session id to phase 2.
+    (AADNonInteractiveUserSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "4-Token use", Source = "NonInteractive", Actor = UserPrincipalName, Detail = strcat(SignInEventTypes, " ", ResultType, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(todynamic(LocationDetails).countryOrRegion), " | token=", IncomingTokenType, " | session=", SessionId)),
+    // 5 — applications signing in on their own after consent.
     (AADServicePrincipalSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "5-Service principal", Source = "ServicePrincipal", Actor = ServicePrincipalName, Detail = strcat(ResultType, " | ", AppId, " -> ", ResourceDisplayName, " | ", IPAddress)),
-    // PHASE 6 — device registration. A joined device yields a Primary Refresh
-    // Token, which outlives revoking the stolen one. Easy to miss in the noise.
+    // 6 — devices and passwordless credentials registered. Each gives a credential that survives token revocation.
     (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where OperationName has_any (DeviceOps) | extend Phase = "6-Device", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", LoggedByService, " | ", tostring(InitiatedBy.user.ipAddress), " | target=", tostring(TargetResources))),
-    // PHASE 7 — directory persistence. MFA methods, consent, secrets, roles.
-    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where not(OperationName has_any (DeviceOps)) | extend Phase = "7-Directory", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", tostring(InitiatedBy.user.ipAddress), " | cel=", tostring(TargetResources))),
-    // PHASE 8 — cloud activity. Mailbox rules, downloads, sharing.
-    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation !has "MailItemsAccessed" | extend Phase = "8-Cloud", Source = "OfficeActivity", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP, " | ", MailboxOwnerUPN))
+    // 7 — every other directory change: MFA methods, consent, roles, secrets.
+    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where not(OperationName has_any (DeviceOps)) | extend Phase = "7-Directory", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", tostring(InitiatedBy.user.ipAddress), " | target=", tostring(TargetResources))),
+    // 8 — Microsoft 365 activity: rules, downloads, sharing.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation !in~ ("MailItemsAccessed") | extend Phase = "8-Cloud", Source = "OfficeActivity", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP, " | ", MailboxOwnerUPN))
 | where Actor contains UserIdentityCheck
 | project-rename EventTime = TimeGenerated
 | project EventTime, Phase, Source, Actor, Detail
 | sort by EventTime asc
 //
-//| where Phase startswith "2-" or Phase startswith "4-"   // token issue and token use only
-//| where Phase startswith "6-"                            // device registration only
-//| where Phase startswith "7-"                            // directory changes only
+//| where Phase in ("2-Code entry","4-Token use")   // token issued and token used — compare IP, ASN and session
+//| where Phase == "6-Device"                         // device registration only
 //| summarize Events = count(), First = min(EventTime), Last = max(EventTime) by Phase

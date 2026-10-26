@@ -1,6 +1,6 @@
 //DeviceCode scope query
 //
-// Who else. Fill in one indicator from devicecode.kql and run.
+// Who else. Fill in one indicator from devicecode.kql. ASN finds campaigns best.
 let TimeToCheck = 30d;
 let IPCheck = "";
 let ASNCheck = "";
@@ -10,11 +10,11 @@ let UserAgentCheck = "";
 let Job = IdentityInfo | where TimeGenerated >= ago(90d) | extend AccountUPN = tolower(AccountUPN) | summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles) | project JobDetails, JobUserKey = AccountUPN;
 //
 union isfuzzy=true
-    // Other device code sign-ins from the same address, network or application.
+    // Device code sign-ins from the same address, network, app or agent.
     (SigninLogs | where TimeGenerated >= ago(TimeToCheck) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | extend Hit = "DeviceCode", Actor = UserPrincipalName, Asn = AutonomousSystemNumber, Agent = UserAgent, Evidence = strcat(ResultType, " | ", AppDisplayName, " -> ", ResourceDisplayName)),
-    // Token use from the same infrastructure against other users.
+    // Token use from the same infrastructure, against any user.
     (AADNonInteractiveUserSignInLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | extend Hit = "TokenUse", Actor = UserPrincipalName, Asn = AutonomousSystemNumber, Agent = UserAgent, Evidence = strcat(SignInEventTypes, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | token=", IncomingTokenType))
-| where (isnotempty(IPCheck) and IPAddress contains IPCheck) or (isnotempty(ASNCheck) and Asn contains ASNCheck) or (isnotempty(AppCheck) and AppDisplayName contains AppCheck) or (isnotempty(UserAgentCheck) and Agent contains UserAgentCheck)
+| where (isnotempty(IPCheck) and IPAddress contains IPCheck) or (isnotempty(ASNCheck) and Asn == ASNCheck) or (isnotempty(AppCheck) and AppDisplayName contains AppCheck) or (isnotempty(UserAgentCheck) and Agent contains UserAgentCheck)
 | extend UserKey = tolower(Actor)
 | join kind=leftouter Job on $left.UserKey == $right.JobUserKey
 | project-rename EventTime = TimeGenerated

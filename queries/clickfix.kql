@@ -1,5 +1,6 @@
 //ClickFix UserPrincipal query
 //
+// Shells and LOLBins launched the ClickFix way, scored. PasteMatch proves the user pasted the command.
 let TimeToCheck = 14d;
 let DeviceCheck = "";
 let UserIdentityCheck = "";
@@ -7,35 +8,38 @@ let CommandCheck = "";
 //
 let Browsers = dynamic(["msedge.exe","chrome.exe","firefox.exe","brave.exe","opera.exe","iexplore.exe","msedgewebview2.exe"]);
 let LolBins = dynamic(["powershell.exe","pwsh.exe","cmd.exe","mshta.exe","wscript.exe","cscript.exe","rundll32.exe","regsvr32.exe","curl.exe","certutil.exe","bitsadmin.exe","msiexec.exe","forfiles.exe","conhost.exe"]);
-// Download and execute in one line — the core of almost every variant.
 let DownloadWords = dynamic(["iex","invoke-expression","iwr","invoke-webrequest","invoke-restmethod","irm","downloadstring","downloadfile","webclient","curl","wget","bitstransfer","urlcache","frombase64string"]);
 let StealthWords = dynamic(["hidden","windowstyle","bypass","noprofile","nop","encodedcommand","enc","noninteractive","unrestricted"]);
 let LureWords = dynamic(["captcha","recaptcha","robot","verification","verify","cloudflare","human","ray","troubleshoot","fixit"]);
 //
+let Candidates = materialize(DeviceProcessEvents
+    | where TimeGenerated >= ago(TimeToCheck)
+    | where FileName in~ (LolBins)
+    | where InitiatingProcessFileName =~ "explorer.exe" or InitiatingProcessFileName in~ (Browsers) or InitiatingProcessParentFileName =~ "explorer.exe" or ProcessCommandLine has_any (DownloadWords) or ProcessCommandLine has_any (StealthWords) or ProcessCommandLine has_any (LureWords)
+    | where DeviceName contains DeviceCheck | where AccountUpn contains UserIdentityCheck or AccountName contains UserIdentityCheck | where ProcessCommandLine contains CommandCheck);
+let CandidateDevices = Candidates | distinct DeviceId;
 // Win+R writes RunMRU; the Explorer address bar writes TypedPaths. Both are a paste the user made.
-let Pastes = DeviceRegistryEvents | where TimeGenerated >= ago(TimeToCheck) | where RegistryKey has @"Explorer\RunMRU" or RegistryKey has @"Explorer\TypedPaths" | where isnotempty(RegistryValueData) | summarize PasteEntries = make_set(RegistryValueData, 50), PasteCount = count(), PasteSurfaces = make_set(iff(RegistryKey has "RunMRU", "Win+R", "Explorer address bar"), 2), FirstPaste = min(TimeGenerated), LastPaste = max(TimeGenerated) by RmDeviceId = DeviceId;
-let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, OSPlatform, DeviceType, PublicIP, OnboardingStatus, SensorHealthState;
+let Pastes = DeviceRegistryEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceId in (CandidateDevices) | where RegistryKey has @"Explorer\RunMRU" or RegistryKey has @"Explorer\TypedPaths" | where isnotempty(RegistryValueData) | summarize PasteEntries = make_set(RegistryValueData, 50), PasteCount = count(), PasteSurfaces = make_set(iff(RegistryKey has "RunMRU", "Win+R", "Explorer address bar"), 2), FirstPaste = min(TimeGenerated), LastPaste = max(TimeGenerated) by RmDeviceId = DeviceId;
+let Machines = DeviceInfo | where TimeGenerated >= ago(TimeToCheck) | where DeviceId in (CandidateDevices) | summarize arg_max(TimeGenerated, *) by DeviceId | project MiDeviceId = DeviceId, OSPlatform, DeviceType, PublicIP, OnboardingStatus, SensorHealthState;
 let Job = IdentityInfo | where AccountUPN contains UserIdentityCheck | where TimeGenerated >= ago(90d) | extend AccountUPN = tolower(AccountUPN) | summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles, "3.Manager", Manager) | project JobDetails, JobUserKey = AccountUPN;
-let NetOut = DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(RemoteUrl) or isnotempty(RemoteIP) | summarize OutboundCount = count(), RemoteUrls = make_set(RemoteUrl, 15), RemoteIPs = make_set(RemoteIP, 15) by NoDeviceId = DeviceId, NoProcessId = InitiatingProcessId;
-let Drops = DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where ActionType in~ ("FileCreated","FileModified") | summarize DroppedFiles = make_set(FileName, 15), DropPaths = make_set(FolderPath, 10), DroppedHashes = make_set(SHA256, 10) by DfDeviceId = DeviceId, DfProcessId = InitiatingProcessId;
-let CmdPrevalence = DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(ProcessCommandLine) | summarize DevicesRanThisCommand = dcount(DeviceId) by CpCmd = ProcessCommandLine;
+// What each process connected to and wrote. Keyed on the process unique id, which unlike a PID is never reused.
+let NetOut = DeviceNetworkEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceId in (CandidateDevices) | where isnotempty(InitiatingProcessUniqueId) | where isnotempty(RemoteUrl) or isnotempty(RemoteIP) | summarize OutboundCount = count(), RemoteUrls = make_set(RemoteUrl, 15), RemoteIPs = make_set(RemoteIP, 15) by NoDeviceId = DeviceId, NoProcessKey = InitiatingProcessUniqueId;
+let Drops = DeviceFileEvents | where TimeGenerated >= ago(TimeToCheck) | where DeviceId in (CandidateDevices) | where isnotempty(InitiatingProcessUniqueId) | where ActionType in~ ("FileCreated","FileModified") | summarize DroppedFiles = make_set(FileName, 15), DropPaths = make_set(FolderPath, 10), DroppedHashes = make_set(SHA256, 10) by DfDeviceId = DeviceId, DfProcessKey = InitiatingProcessUniqueId;
+// How many devices in the estate ran exactly this command. ClickFix commands are unique to the victim.
+let CmdPrevalence = DeviceProcessEvents | where TimeGenerated >= ago(TimeToCheck) | where ProcessCommandLine in ((Candidates | distinct ProcessCommandLine)) | summarize DevicesRanThisCommand = dcount(DeviceId) by CpCmd = ProcessCommandLine;
 //
-DeviceProcessEvents
-| where TimeGenerated >= ago(TimeToCheck)
-| where FileName in~ (LolBins)
-| where InitiatingProcessFileName =~ "explorer.exe" or InitiatingProcessFileName in~ (Browsers) or InitiatingProcessParentFileName =~ "explorer.exe" or ProcessCommandLine has_any (DownloadWords) or ProcessCommandLine has_any (StealthWords) or ProcessCommandLine has_any (LureWords)
+Candidates
 | extend AccountKey = tolower(AccountUpn)
-| join kind=leftouter Pastes on $left.DeviceId == $right.RmDeviceId | join kind=leftouter Machines on $left.DeviceId == $right.MiDeviceId | join kind=leftouter Job on $left.AccountKey == $right.JobUserKey | join kind=leftouter NetOut on $left.DeviceId == $right.NoDeviceId, $left.ProcessId == $right.NoProcessId | join kind=leftouter Drops on $left.DeviceId == $right.DfDeviceId, $left.ProcessId == $right.DfProcessId | join kind=leftouter CmdPrevalence on $left.ProcessCommandLine == $right.CpCmd
+| join kind=leftouter Pastes on $left.DeviceId == $right.RmDeviceId | join kind=leftouter Machines on $left.DeviceId == $right.MiDeviceId | join kind=leftouter Job on $left.AccountKey == $right.JobUserKey | join kind=leftouter NetOut on $left.DeviceId == $right.NoDeviceId, $left.ProcessUniqueId == $right.NoProcessKey | join kind=leftouter Drops on $left.DeviceId == $right.DfDeviceId, $left.ProcessUniqueId == $right.DfProcessKey | join kind=leftouter CmdPrevalence on $left.ProcessCommandLine == $right.CpCmd
 | extend PasteList = iff(array_length(todynamic(PasteEntries)) > 0, todynamic(PasteEntries), dynamic([""]))
 | mv-apply E = PasteList to typeof(string) on ( extend Args = extract(@"^\S+\s+(.*)$", 1, trim_end(@"\\1", E)) | summarize PasteMatch = make_set_if(E, isnotempty(Args) and ProcessCommandLine contains Args, 5) )
 | extend ParentIsExplorer = InitiatingProcessFileName =~ "explorer.exe" or InitiatingProcessParentFileName =~ "explorer.exe", ParentIsBrowser = InitiatingProcessFileName in~ (Browsers) or InitiatingProcessParentFileName in~ (Browsers), HasDownload = ProcessCommandLine has_any (DownloadWords), HasStealth = ProcessCommandLine has_any (StealthWords), HasLure = ProcessCommandLine has_any (LureWords) or ProcessCommandLine contains "✅" or ProcessCommandLine contains "✔", HasBase64 = ProcessCommandLine matches regex @"[A-Za-z0-9+/]{40,}={0,2}", LongCommand = strlen(ProcessCommandLine) > 200, BareShell = strlen(ProcessCommandLine) <= 40
 | extend PasteCount = coalesce(PasteCount, 0), DevicesRanThisCommand = coalesce(DevicesRanThisCommand, 0), PasteHits = array_length(PasteMatch)
 // 11 indicators, 15 at most.
 | extend ClickFixScore = toint(PasteHits > 0) * 3 + toint(ParentIsExplorer) * 2 + toint(PasteCount > 0) * 2 + toint(HasDownload) + toint(HasStealth) + toint(HasLure) + toint(HasBase64) + toint(LongCommand) + toint(ParentIsBrowser) + toint(BareShell and (ParentIsExplorer or ParentIsBrowser)) + toint(DevicesRanThisCommand > 0 and DevicesRanThisCommand <= 2)
-| where DeviceName contains DeviceCheck | where AccountUpn contains UserIdentityCheck or AccountName contains UserIdentityCheck | where ProcessCommandLine contains CommandCheck
 | project-rename EventTime = TimeGenerated
 | project-reorder EventTime, ClickFixScore, PasteHits, PasteMatch, PasteSurfaces, DeviceName, AccountUpn, AccountName, JobDetails, FileName, ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessParentFileName, InitiatingProcessCommandLine, ParentIsExplorer, ParentIsBrowser, BareShell, HasDownload, HasStealth, HasLure, HasBase64, LongCommand, DevicesRanThisCommand, PasteCount, PasteEntries, FirstPaste, LastPaste, OutboundCount, RemoteUrls, RemoteIPs, DroppedFiles, DropPaths, DroppedHashes, FolderPath, SHA256, ProcessIntegrityLevel, ProcessTokenElevation, OSPlatform, DeviceType, MachineGroup, PublicIP, OnboardingStatus, SensorHealthState, DeviceId, ProcessId
-| project-away SourceSystem, Type, TenantId, ReportId, AppGuardContainerId, CreatedProcessSessionId, InitiatingProcessSessionId, LogonId, InitiatingProcessLogonId, AccountSid, InitiatingProcessAccountSid, AccountObjectId, InitiatingProcessAccountObjectId, MD5, InitiatingProcessMD5, SHA1, InitiatingProcessSHA1, FileSize, InitiatingProcessFileSize, ProcessUniqueId, InitiatingProcessUniqueId, ProcessRemoteSessionDeviceName, ProcessRemoteSessionIP, InitiatingProcessRemoteSessionDeviceName, InitiatingProcessRemoteSessionIP, InitiatingProcessVersionInfoInternalFileName, InitiatingProcessVersionInfoOriginalFileName, InitiatingProcessVersionInfoProductVersion, ProcessVersionInfoInternalFileName, ProcessVersionInfoOriginalFileName, ProcessVersionInfoProductVersion, PasteList, AccountKey, RmDeviceId, MiDeviceId, JobUserKey, NoDeviceId, NoProcessId, DfDeviceId, DfProcessId, CpCmd
+| project-away SourceSystem, Type, TenantId, ReportId, AppGuardContainerId, CreatedProcessSessionId, InitiatingProcessSessionId, LogonId, InitiatingProcessLogonId, AccountSid, InitiatingProcessAccountSid, AccountObjectId, InitiatingProcessAccountObjectId, MD5, InitiatingProcessMD5, SHA1, InitiatingProcessSHA1, FileSize, InitiatingProcessFileSize, ProcessUniqueId, InitiatingProcessUniqueId, ProcessRemoteSessionDeviceName, ProcessRemoteSessionIP, InitiatingProcessRemoteSessionDeviceName, InitiatingProcessRemoteSessionIP, InitiatingProcessVersionInfoInternalFileName, InitiatingProcessVersionInfoOriginalFileName, InitiatingProcessVersionInfoProductVersion, ProcessVersionInfoInternalFileName, ProcessVersionInfoOriginalFileName, ProcessVersionInfoProductVersion, PasteList, AccountKey, RmDeviceId, MiDeviceId, JobUserKey, NoDeviceId, NoProcessKey, DfDeviceId, DfProcessKey, CpCmd
 | sort by ClickFixScore desc, EventTime desc
 //
 //| where PasteHits > 0                        // confirmed pastes only — the text ran verbatim

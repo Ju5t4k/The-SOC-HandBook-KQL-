@@ -5,21 +5,21 @@
 | [`signinlogs.kql`](signinlogs.kql) | `SigninLogs` | Was this account used, and by whom. Job details, new-starter check, and day-counts for the IP, device, location, user agent and application |
 | [`auditlogs.kql`](auditlogs.kql) | `AuditLogs` | What did they change once they were in. Actor and target on every row, old and new values unpacked, and how routine the operation is for that actor |
 | [`officeactivity.kql`](officeactivity.kql) | `OfficeActivity` | What did they actually do to the data. Exchange, SharePoint, OneDrive and Teams activity with the source address scored against the account's sign-ins |
-| [`clickfix.kql`](clickfix.kql) | `DeviceProcessEvents` | One-shot ClickFix triage. Scores a process against the fake-CAPTCHA pattern and proves the paste from the `RunMRU` and `TypedPaths` registry keys |
+| [`clickfix.kql`](clickfix.kql) | `DeviceProcessEvents` | ClickFix triage. Scores each candidate process (11 indicators) and proves the paste from `RunMRU` and `TypedPaths`. Network and file evidence joined on the exact process, not the PID |
 | [`clickfix-paste.kql`](clickfix-paste.kql) | `DeviceProcessEvents`, `DeviceEvents`, `DeviceRegistryEvents` | The paste surfaces Win+R is not — the Explorer address bar, a browser-spawned shell, a console with no command line, a macOS Terminal. Run it when `clickfix.kql` is empty |
 | [`clickfix-timeline.kql`](clickfix-timeline.kql) | `Device*`, `UrlClickEvents`, `SigninLogs`, non-interactive, `AuditLogs`, `OfficeActivity` | The ClickFix incident as one timeline, tagged by phase: lure, paste, execution, download, disk, persistence, defence, identity, cloud |
 | [`clickfix-impact.kql`](clickfix-impact.kql) | `Device*` | What the payload took. Browser credential stores, LSASS, staged archives, exfil channels, RMM tooling and defence tampering |
-| [`clickfix-persistence.kql`](clickfix-persistence.kql) | `Device*` | What was left behind — run keys, tasks, services, startup folder, LOLBin drops, COM and shell hijacks, browser extensions. The reimage decision |
+| [`clickfix-persistence.kql`](clickfix-persistence.kql) | `Device*` | What was left behind — run keys, Winlogon, IFEO, tasks, services, startup folder, LOLBin drops, COM and shell hijacks, forced browser extensions. The reimage decision |
 | [`clickfix-scope.kql`](clickfix-scope.kql) | `Device*`, `EmailUrlInfo`, `UrlClickEvents` | Blast radius. Give it a URL, hash, command or IP and it finds every other device and user hit the same way — and everyone who was sent the lure but has not clicked yet |
-| [`devicecode.kql`](devicecode.kql) | `SigninLogs` | Device code phishing triage. Finds `AuthenticationProtocol == "deviceCode"` sign-ins and scores them, including whether the issued token was later used from a different ASN |
-| [`devicecode-timeline.kql`](devicecode-timeline.kql) | `SigninLogs`, non-interactive, service principal, `AuditLogs`, `OfficeActivity` | The device code incident as one timeline: delivery, code entry, token use, service principals, directory changes, cloud activity |
-| [`devicecode-persistence.kql`](devicecode-persistence.kql) | `AuditLogs`, `OfficeActivity`, service principal | What survives a password reset — MFA methods, app consent, service principal credentials, mailbox rules |
+| [`devicecode.kql`](devicecode.kql) | `SigninLogs` | Device code phishing triage. Scores `deviceCode` sign-ins (9 indicators), including whether the same session was later used from another ASN and whether a device was registered after |
+| [`devicecode-timeline.kql`](devicecode-timeline.kql) | `SigninLogs`, non-interactive, service principal, `AuditLogs`, `OfficeActivity` | The device code incident as one timeline: delivery (mail and Teams), code entry, sign-ins, token use, service principals, device, directory, cloud |
+| [`devicecode-persistence.kql`](devicecode-persistence.kql) | `AuditLogs`, `OfficeActivity`, service principal | What survives a password reset — MFA methods, registered devices, app consent and what the consented app then did, mailbox rules |
 | [`devicecode-scope.kql`](devicecode-scope.kql) | `SigninLogs`, non-interactive | Blast radius by IP, ASN, app or user agent. ASN is the one that finds the campaign |
-| [`bec.kql`](bec.kql) | `OfficeActivity` | BEC triage. Scores mailbox rules, forwarding and delegation for the hide-and-redirect pattern, against outbound volume and whether the actor signed in from that address |
+| [`bec.kql`](bec.kql) | `OfficeActivity` | BEC triage. Scores mailbox rules, forwarding and delegation for the hide-and-redirect pattern (7 indicators), against peak daily outbound and whether the actor signed in from that address |
 | [`bec-timeline.kql`](bec-timeline.kql) | `SigninLogs`, `OfficeActivity`, `EmailEvents`, `AuditLogs` | The BEC as one timeline: access, reconnaissance, mailbox change, outbound fraud, the hijacked thread, directory changes, files |
 | [`bec-persistence.kql`](bec-persistence.kql) | `OfficeActivity`, `AuditLogs` | Rules, forwarding, delegation, tenant-wide transport rules and directory footholds — everything a password reset leaves behind |
 | [`bec-scope.kql`](bec-scope.kql) | `OfficeActivity`, `EmailEvents`, `SigninLogs` | Other mailboxes forwarding to the same place, and every outside party who received the fraudulent thread |
-| [`attachment.kql`](attachment.kql) | `EmailAttachmentInfo`, `EmailEvents`, `Device*` | Attachment triage. Joins the mail verdict to the endpoint on `SHA256` — did it land, did it run |
+| [`attachment.kql`](attachment.kql) | `EmailAttachmentInfo`, `EmailEvents`, `Device*` | Attachment triage. Joins the mail verdict to the endpoint on `SHA256` — did it land, did it run, did authentication fail (9 indicators) |
 | [`attachment-timeline.kql`](attachment-timeline.kql) | `Email*`, `UrlClickEvents`, `Device*` | Delivery, attachment, links, clicks, ZAP and endpoint execution on one timeline, keyed off a message id or a hash |
 | [`attachment-scope.kql`](attachment-scope.kql) | `Email*`, `Device*` | Everyone who received the same file, sender or subject, and every device it reached or ran on |
 | [`hok.kql`](hok.kql) | `Device*` | Hands-on-keyboard triage. Is a person driving this device, and are they still on it? Eleven indicators, scored, with `ActiveNow` |
@@ -37,8 +37,8 @@
 The first three are identity and activity tables and run in sequence.
 
 The `clickfix-*`, `devicecode-*`, `bec-*`, `attachment-*` and `hok-*` files are
-threat-specific and meant to be worked in order. Each set has a playbook carrying the attack timeline, the
-phase-by-phase investigation, the containment order and the ticket checklist:
+threat-specific and meant to be worked in order. Each set has a playbook with
+the steps, containment order and ticket checklist:
 
 - [`../docs/clickfix-playbook.md`](../docs/clickfix-playbook.md) — endpoint
   side, fake-CAPTCHA paste-and-run execution
@@ -51,7 +51,6 @@ phase-by-phase investigation, the containment order and the ticket checklist:
 - [`../docs/hok-playbook.md`](../docs/hok-playbook.md) — a person operating
   inside the estate: connections, web, files, lateral movement, exfiltration,
   IOCs and IOAs, and the root cause analysis
-
 
 ## The order to run them in
 
