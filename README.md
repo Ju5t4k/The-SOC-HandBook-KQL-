@@ -25,6 +25,10 @@ docs/       playbooks and reference
 - [Hands-on-keyboard intrusion](docs/hok-playbook.md) — a person operating on
   a device. Twelve steps from "are they still here" to root cause, plus
   collection from the Defender portal without a query.
+- [Teams vishing and helpdesk impersonation](docs/teams-vishing-playbook.md) —
+  mail flood, a Teams call from fake IT, Quick Assist or another remote tool,
+  then recon, staging, lateral movement and Rclone. Ten steps, each with a KQL
+  ladder from L1 to expert, written to teach.
 - [PHP2Shell and Node2Shell](docs/webrce-playbook.md) — the October 2026 PHP
   and Node.js remote code execution bugs. Which servers are exposed, was one
   exploited, and the hand-off to the hands-on-keyboard playbook.

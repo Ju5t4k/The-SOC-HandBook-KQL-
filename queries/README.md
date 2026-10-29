@@ -58,6 +58,8 @@ the steps, containment order and ticket checklist:
   IOCs and IOAs, and the root cause analysis
 - [`../docs/webrce-playbook.md`](../docs/webrce-playbook.md) — web servers,
   PHP2Shell and Node2Shell exposure and exploitation
+- [`../docs/teams-vishing-playbook.md`](../docs/teams-vishing-playbook.md) —
+  Teams helpdesk impersonation and Quick Assist; queries live in the playbook
 
 ## The order to run them in
 
