@@ -1,0 +1,43 @@
+//DC-03 Device code sign-in by a first-time or unapproved user
+//
+// Logic:           Device code code-entries (any result) by users who made no successful device code sign-in in the
+//                  baseline, or who are outside the approved list or group. Failures are kept: a failed attempt still
+//                  means someone was asked for a code.
+// Tuning:          ApprovedUsers, or ApprovedGroup (needs IdentityInfo / UEBA). Leave both empty to alert on first use only.
+//                  baseline: 13d in a rule; 90d in a hunting run gives far fewer first-time hits.
+// False positives: New Teams Rooms or kiosk accounts, a developer's first Azure CLI login, a new starter.
+// Data:            SigninLogs (Microsoft Entra ID connector). Optional: IdentityInfo (UEBA) for group membership.
+// Lookback:        Rule runs every 1h over 14d. Reads device code sign-ins only, so volume is low.
+// Playbook:        docs/devicecode-playbook.md#52-new-location-or-agent
+// ATT&CK:          T1078.004, T1528
+//
+let alert_window = 1h;
+let baseline = 13d;
+// Approved users. Or: let ApprovedUsers = toscalar(_GetWatchlist('DeviceCodeAllowedUsers') | summarize make_list(SearchKey));
+let ApprovedUsers = dynamic([]);
+let ApprovedGroup = "";                      // display name of an approved group, read from IdentityInfo.GroupMembership
+let PriorUsers = SigninLogs
+    | where TimeGenerated between (ago(alert_window + baseline) .. ago(alert_window))
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | distinct UserId;
+// Group members, if a group is set and UEBA is on. The empty datatable keeps the query running without UEBA.
+let GroupMembers = union isfuzzy=true
+        (datatable(AccountObjectId: string)[]),
+        (IdentityInfo
+            | where isnotempty(ApprovedGroup)
+            | where TimeGenerated > ago(14d)
+            | summarize arg_max(TimeGenerated, GroupMembership) by AccountObjectId
+            | where tostring(GroupMembership) has ApprovedGroup
+            | project AccountObjectId)
+    | distinct AccountObjectId;
+let ApprovalConfigured = array_length(ApprovedUsers) > 0 or isnotempty(ApprovedGroup);
+SigninLogs
+| where TimeGenerated > ago(alert_window)
+| where AuthenticationProtocol =~ "deviceCode"
+| extend FirstTimeUser = UserId !in (PriorUsers),
+         Unapproved = ApprovalConfigured and UserPrincipalName !in~ (ApprovedUsers) and UserId !in (GroupMembers)
+| where FirstTimeUser or Unapproved
+| extend Reason = case(FirstTimeUser and Unapproved, "First device code use and not approved", FirstTimeUser, "First device code use in the baseline", "Not in the approved list or group"),
+         Country = tostring(LocationDetails.countryOrRegion)
+| project TimeGenerated, UserPrincipalName, UserId, Reason, ResultType, ResultDescription, AppDisplayName, AppId, ResourceDisplayName,
+          IPAddress, AutonomousSystemNumber, Country, UserAgent, SessionId, CorrelationId

@@ -1,0 +1,76 @@
+id: 2c736c95-d5ef-426c-bf41-4452a0b639a7
+name: Device code sign-in by first-time or unapproved user
+description: |
+  A device code sign-in, successful or not, by a user with no device code use in the baseline or outside the approved users or group.
+severity: Medium
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+queryFrequency: 1h
+queryPeriod: 14d
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+  - CredentialAccess
+relevantTechniques:
+  - T1078.004
+  - T1528
+query: |
+  let alert_window = 1h;
+  let baseline = 13d;
+  // Approved users. Or: let ApprovedUsers = toscalar(_GetWatchlist('DeviceCodeAllowedUsers') | summarize make_list(SearchKey));
+  let ApprovedUsers = dynamic([]);
+  let ApprovedGroup = "";                      // display name of an approved group, read from IdentityInfo.GroupMembership
+  let PriorUsers = SigninLogs
+      | where TimeGenerated between (ago(alert_window + baseline) .. ago(alert_window))
+      | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+      | distinct UserId;
+  // Group members, if a group is set and UEBA is on. The empty datatable keeps the query running without UEBA.
+  let GroupMembers = union isfuzzy=true
+          (datatable(AccountObjectId: string)[]),
+          (IdentityInfo
+              | where isnotempty(ApprovedGroup)
+              | where TimeGenerated > ago(14d)
+              | summarize arg_max(TimeGenerated, GroupMembership) by AccountObjectId
+              | where tostring(GroupMembership) has ApprovedGroup
+              | project AccountObjectId)
+      | distinct AccountObjectId;
+  let ApprovalConfigured = array_length(ApprovedUsers) > 0 or isnotempty(ApprovedGroup);
+  SigninLogs
+  | where TimeGenerated > ago(alert_window)
+  | where AuthenticationProtocol =~ "deviceCode"
+  | extend FirstTimeUser = UserId !in (PriorUsers),
+           Unapproved = ApprovalConfigured and UserPrincipalName !in~ (ApprovedUsers) and UserId !in (GroupMembers)
+  | where FirstTimeUser or Unapproved
+  | extend Reason = case(FirstTimeUser and Unapproved, "First device code use and not approved", FirstTimeUser, "First device code use in the baseline", "Not in the approved list or group"),
+           Country = tostring(LocationDetails.countryOrRegion)
+  | project TimeGenerated, UserPrincipalName, UserId, Reason, ResultType, ResultDescription, AppDisplayName, AppId, ResourceDisplayName,
+            IPAddress, AutonomousSystemNumber, Country, UserAgent, SessionId, CorrelationId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserPrincipalName
+      - identifier: AadUserId
+        columnName: UserId
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: IPAddress
+customDetails:
+  Reason: Reason
+  ResultType: ResultType
+  App: AppDisplayName
+  Resource: ResourceDisplayName
+  ASN: AutonomousSystemNumber
+  Country: Country
+  SessionId: SessionId
+alertDetailsOverride:
+  alertDisplayNameFormat: 'Device code sign-in by {{UserPrincipalName}}: {{Reason}}'
+  alertDescriptionFormat: '{{UserPrincipalName}} used device code for {{AppDisplayName}}. See docs/devicecode-playbook.md section 5.2.'
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+version: 1.0.0
+kind: Scheduled

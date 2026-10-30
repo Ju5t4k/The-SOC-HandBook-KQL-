@@ -1,0 +1,40 @@
+//DC-07 App consent, app role or service principal credential after a device code sign-in
+//
+// Logic:           Within `follow` of a device code sign-in, the same user consented to an app, granted a delegated
+//                  permission or app role, created an app or service principal, added a credential, or became an owner.
+//                  Scopes are pulled from the consent record; HighRiskScope marks mail, files, directory write and offline_access.
+// Tuning:          follow. HighRiskScopes. If users may consent to a known set of apps, exclude them by AppName.
+// False positives: A user consenting to a meeting or productivity add-in on the day of a legitimate device code sign-in.
+//                  The attacker's own app: unknown publisher, consented minutes after the code, high-risk scopes.
+// Data:            SigninLogs, AuditLogs (Microsoft Entra ID connector).
+// Lookback:        Rule runs every 1h over 2d. App changes are read for the last hour only.
+// Playbook:        docs/devicecode-playbook.md#56-apps-and-consent
+// ATT&CK:          T1528, T1098.001, T1671
+//
+let alert_window = 1h;
+let follow = 1d;
+let AppOps = dynamic(["Consent to application", "Add delegated permission grant", "Add app role assignment to service principal", "Add app role assignment grant to user", "Add service principal", "Add service principal credentials", "Add application", "Certificates and secrets management", "Add owner to application", "Add owner to service principal"]);
+let HighRiskScopes = dynamic(["Mail.Read", "Mail.ReadWrite", "Mail.Send", "MailboxSettings.ReadWrite", "Files.Read.All", "Files.ReadWrite.All", "Sites.Read.All", "Sites.ReadWrite.All", "Directory.ReadWrite.All", "User.ReadWrite.All", "Application.ReadWrite.All", "full_access_as_user", "offline_access"]);
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | project CodeTime = TimeGenerated, UserKey = tolower(UserPrincipalName), UserPrincipalName, UserId, CodeIP = IPAddress, CodeApp = AppDisplayName, SessionId;
+let AppChanges = AuditLogs
+    | where TimeGenerated > ago(alert_window)
+    | where OperationName has_any (AppOps)
+    | where Result =~ "success"
+    | extend Actor = tolower(tostring(InitiatedBy.user.userPrincipalName))
+    | where isnotempty(Actor)
+    | extend Props = tostring(TargetResources[0].modifiedProperties)
+    // VERIFY: consent records carry "Scope: <scopes>" inside ConsentAction.Permissions
+    | project ChangeTime = TimeGenerated, Actor, OperationName, AppName = tostring(TargetResources[0].displayName), AppObjectId = tostring(TargetResources[0].id),
+              AppObjectType = tostring(TargetResources[0].type), Scopes = trim(@"\s", extract(@"Scope:\s*([^,\]]+)", 1, Props)),
+              AdminConsent = Props has "IsAdminConsent" and Props has "True", ChangeIP = tostring(InitiatedBy.user.ipAddress), CorrelationId;
+AppChanges
+| join kind=inner CodeEntries on $left.Actor == $right.UserKey
+| where ChangeTime between (CodeTime .. (CodeTime + follow))
+| summarize arg_max(CodeTime, *) by CorrelationId, OperationName
+| extend MinutesAfterCode = datetime_diff("minute", ChangeTime, CodeTime),
+         HighRiskScope = Scopes has_any (HighRiskScopes)
+| project TimeGenerated = ChangeTime, UserPrincipalName, UserId, OperationName, AppName, AppObjectId, AppObjectType, Scopes, HighRiskScope, AdminConsent,
+          ChangeIP, CodeTime, CodeIP, CodeApp, MinutesAfterCode, SessionId, CorrelationId

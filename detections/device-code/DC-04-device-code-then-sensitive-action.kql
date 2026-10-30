@@ -1,0 +1,46 @@
+//DC-04 Device code sign-in followed by a sensitive action
+//
+// Logic:           A successful device code code-entry, then within `follow` minutes the same user (as actor, or as target
+//                  when Entra logs the change as done by a service) registers a device or an MFA method, consents to or
+//                  creates an app, gains a role or group, creates a user, resets a password, changes Conditional Access,
+//                  or sets a mailbox rule, forwarding or permission. Joined on the UPN.
+// Tuning:          follow (N minutes). SensitiveOps and MailOps: remove what is routine for your users. DC-05/06/07/09 are
+//                  the narrow, longer-window versions of this rule; keep this one as the fast catch-all.
+// False positives: A user setting up a new Teams Rooms device or phone right after a legitimate device code sign-in.
+//                  ActionFromOtherIP = true (the change came from an IP other than the code entry's) is the stronger case.
+// Data:            SigninLogs, AuditLogs (Microsoft Entra ID connector); OfficeActivity (Microsoft 365 connector, Exchange).
+// Lookback:        Rule runs every 1h over 2h. Code entries are read for alert_window + follow; actions only for the last
+//                  alert_window, so one action raises one alert.
+// Playbook:        docs/devicecode-playbook.md#33-what-happened-next
+// ATT&CK:          T1098.005, T1098.001, T1556.006, T1114.003, T1136.003
+//
+let alert_window = 1h;
+let follow = 60m;                         // N minutes after the code entry
+// Matched as phrases on AuditLogs.OperationName.
+let SensitiveOps = dynamic(["Add device", "Register device", "Add registered owner to device", "Add registered users to device", "security info", "Windows Hello for Business", "passwordless phone sign-in", "Passkey", "Consent to application", "Add delegated permission grant", "Add app role assignment", "Add service principal", "Add application", "Certificates and secrets management", "Add owner to application", "Add owner to service principal", "Add member to role", "Add eligible member to role", "Add member to group", "Add user", "Reset password", "Reset user password", "Change user password", "conditional access policy"]);
+let MailOps = dynamic(["New-InboxRule", "Set-InboxRule", "Enable-InboxRule", "UpdateInboxRules", "Set-Mailbox", "Add-MailboxPermission", "Add-RecipientPermission", "Set-MailboxFolderPermission", "Add-MailboxFolderPermission"]);
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | project CodeTime = TimeGenerated, UserKey = tolower(UserPrincipalName), UserPrincipalName, UserId, CodeIP = IPAddress, AppDisplayName, SessionId;
+let Actions = union
+        (AuditLogs
+            | where TimeGenerated > ago(alert_window)
+            | where OperationName has_any (SensitiveOps)
+            | mv-apply T = TargetResources on (summarize TargetUpn = take_anyif(tostring(T.userPrincipalName), isnotempty(tostring(T.userPrincipalName))), TargetName = take_any(tostring(T.displayName)))
+            | project ActionTime = TimeGenerated, ActorKey = tolower(coalesce(tostring(InitiatedBy.user.userPrincipalName), TargetUpn)), Action = OperationName, Source = "AuditLogs", ActionIP = tostring(InitiatedBy.user.ipAddress), Detail = strcat(TargetName, " | by ", coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)))),
+        (OfficeActivity
+            | where TimeGenerated > ago(alert_window)
+            | where Operation in~ (MailOps)
+            | project ActionTime = TimeGenerated, ActorKey = tolower(UserId), Action = Operation, Source = "OfficeActivity", ActionIP = ClientIP, Detail = substring(Parameters, 0, 500))
+    | where isnotempty(ActorKey);
+CodeEntries
+| join kind=inner Actions on $left.UserKey == $right.ActorKey
+| where ActionTime between (CodeTime .. (CodeTime + follow))
+| summarize FirstAction = min(ActionTime), Actions = make_set(Action, 20), Sources = make_set(Source, 2), ActionIPs = make_set_if(ActionIP, isnotempty(ActionIP), 10), Details = make_set(Detail, 10)
+            by CodeTime, UserPrincipalName, UserId, CodeIP, AppDisplayName, SessionId
+| extend MinutesToFirstAction = datetime_diff("minute", FirstAction, CodeTime),
+         ActionFromOtherIP = array_length(set_difference(ActionIPs, pack_array(CodeIP))) > 0,
+         ActionList = strcat_array(Actions, ", ")
+| project TimeGenerated = FirstAction, UserPrincipalName, UserId, CodeTime, CodeIP, AppDisplayName, MinutesToFirstAction, ActionList, Actions, Sources,
+          ActionIPs, ActionFromOtherIP, Details, SessionId

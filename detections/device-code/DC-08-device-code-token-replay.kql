@@ -1,0 +1,58 @@
+//DC-08 Token replay from a device code session
+//
+// Logic:           Successful sign-ins in the last hour that belong to a device code session (same SessionId as a code
+//                  entry in the last day, or OriginalTransferMethod = deviceCodeFlow) and show replay: an ASN other than the
+//                  code entry's, three or more client apps in one session (FOCI refresh-token hopping), or a scripting
+//                  user agent. Non-interactive and interactive tables are both read: protocol tracking can surface in either.
+// Tuning:          KnownEgressAsns (corporate and VPN ASNs). FociApps (raise to 4 if Office clients legitimately fan out).
+//                  ToolAgents: Azure CLI itself sends a python user agent, so CLI users who move networks will match.
+// False positives: A user moving from office to home inside a session (different ASN). Mobile carrier changes.
+//                  Azure CLI used from a laptop that roams. All three together are rare for real users.
+// Data:            SigninLogs, AADNonInteractiveUserSignInLogs (Microsoft Entra ID connector; non-interactive logs must be
+//                  enabled in the diagnostic setting).
+// Lookback:        Rule runs every 1h over 2d. Non-interactive volume is high: the session filter runs first, so only
+//                  device code sessions are summarised. Sessions whose code entry is older than `follow` are not checked
+//                  here; use DC-16 for those.
+// Playbook:        docs/devicecode-playbook.md#53-token-replay
+// ATT&CK:          T1550.001, T1528, T1078.004
+//
+let alert_window = 1h;
+let follow = 1d;
+let FociApps = 3;
+let KnownEgressAsns = dynamic([]);        // corporate and VPN ASNs, as strings
+let ToolAgents = @"(?i)(python|aiohttp|requests/|axios|node-fetch|undici|go-http-client|curl/|wget|powershell|okhttp|java/|libwww)";
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | where isnotempty(SessionId)
+    | summarize arg_min(TimeGenerated, UserPrincipalName, UserId, IPAddress, AutonomousSystemNumber, AppDisplayName) by SessionId
+    | project CodeTime = TimeGenerated, SessionId, UserPrincipalName, CodeUserId = UserId, CodeIP = IPAddress, CodeAsn = tostring(AutonomousSystemNumber), CodeApp = AppDisplayName;
+let Sessions = CodeEntries | distinct SessionId;
+let TokenUse = union
+        (AADNonInteractiveUserSignInLogs
+            | where TimeGenerated > ago(alert_window)
+            | where SessionId in (Sessions) or OriginalTransferMethod =~ "deviceCodeFlow"
+            | where ResultType == "0"
+            | project TimeGenerated, SessionId, IPAddress, Asn = tostring(AutonomousSystemNumber), AppId, AppDisplayName, ResourceDisplayName, UserAgent, AuthenticationRequirement, Source = "NonInteractive"),
+        (SigninLogs
+            | where TimeGenerated > ago(alert_window)
+            | where AuthenticationProtocol !~ "deviceCode"
+            | where SessionId in (Sessions) or OriginalTransferMethod =~ "deviceCodeFlow"
+            | where ResultType == "0"
+            | project TimeGenerated, SessionId, IPAddress, Asn = tostring(AutonomousSystemNumber), AppId, AppDisplayName, ResourceDisplayName, UserAgent, AuthenticationRequirement, Source = "Interactive");
+TokenUse
+| join kind=inner CodeEntries on SessionId
+| summarize FirstUse = min(TimeGenerated), LastUse = max(TimeGenerated), Uses = count(), UseIPs = make_set(IPAddress, 20), UseAsns = make_set(Asn, 10),
+            Apps = make_set(AppDisplayName, 20), AppCount = dcount(AppId), Resources = make_set(ResourceDisplayName, 20), Agents = make_set(UserAgent, 10),
+            SingleFactorUses = countif(AuthenticationRequirement =~ "singleFactorAuthentication")
+            by SessionId, UserPrincipalName, CodeUserId, CodeTime, CodeIP, CodeAsn, CodeApp
+| extend OtherAsns = set_difference(set_difference(UseAsns, pack_array(CodeAsn)), KnownEgressAsns),
+         OtherIPs = set_difference(UseIPs, pack_array(CodeIP))
+| extend AsnMoved = array_length(OtherAsns) > 0,
+         FociHopping = AppCount >= FociApps,
+         ToolAgent = strcat_array(Agents, " ") matches regex ToolAgents
+| where AsnMoved or FociHopping or ToolAgent
+| extend Indicators = strcat_array(set_difference(pack_array(iff(AsnMoved, "token used from another ASN", ""), iff(FociHopping, "FOCI app-hopping", ""), iff(ToolAgent, "tool user agent", "")), dynamic([""])), ", "),
+         ReplayIP = tostring(OtherIPs[0])
+| project TimeGenerated = FirstUse, UserPrincipalName, UserId = CodeUserId, Indicators, ReplayIP, OtherIPs, OtherAsns, CodeIP, CodeAsn, CodeTime, CodeApp,
+          Apps, AppCount, Resources, Agents, Uses, SingleFactorUses, LastUse, SessionId

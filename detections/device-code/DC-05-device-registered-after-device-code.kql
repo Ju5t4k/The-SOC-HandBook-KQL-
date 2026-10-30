@@ -1,0 +1,54 @@
+//DC-05 Device registered or joined after a device code sign-in
+//
+// Logic:           A device registration or join (Add device, Register device, Add registered owner/users to device) for a
+//                  user who completed a device code sign-in in the previous `follow` window. Entra often logs these as done
+//                  by the Device Registration Service, so the user is taken from the targets and the events of one
+//                  registration are grouped by CorrelationId. BrokerPath marks the Storm-2372 technique: the code was
+//                  entered for the Microsoft Authentication Broker, or that session later took a Device Registration Service token.
+// Tuning:          follow (how long after the code entry a registration counts). Exclude onboarding service accounts
+//                  that register Teams Rooms devices on purpose.
+// False positives: A user enrolling a new phone or PC on the day they used device code for a CLI tool. A registration
+//                  with BrokerPath = true and a device name you don't issue is not one of those.
+// Data:            SigninLogs, AADNonInteractiveUserSignInLogs, AuditLogs (Microsoft Entra ID connector).
+// Lookback:        Rule runs every 1h over 2d. Registrations are read for the last hour only.
+// Playbook:        docs/devicecode-playbook.md#54-device-registration
+// ATT&CK:          T1098.005
+//
+let alert_window = 1h;
+let follow = 1d;
+let DeviceOps = dynamic(["Add device", "Register device", "Add registered owner to device", "Add registered users to device"]);
+let BrokerApp = "29d9ed98-a469-4536-ade2-f981bc1d605e";        // Microsoft Authentication Broker
+let DrsResource = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9";      // Device Registration Service
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | project CodeTime = TimeGenerated, UserKey = tolower(UserPrincipalName), UserPrincipalName, UserId, CodeIP = IPAddress, CodeApp = AppDisplayName, CodeAppId = AppId,
+              SessionId, BrokerToDrs = AppId == BrokerApp and ResourceId == DrsResource;
+// The Broker's refresh token redeemed for the Device Registration Service later in the same session.
+let DrsInSession = AADNonInteractiveUserSignInLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AppId == BrokerApp and (ResourceIdentity == DrsResource or ResourceDisplayName =~ "Device Registration Service")
+    | summarize DrsTokenTime = min(TimeGenerated), DrsTokenIPs = make_set(IPAddress, 5) by SessionId;
+// One row per registration operation, with the user found in any of its events.
+let Registrations = AuditLogs
+    | where TimeGenerated > ago(alert_window)
+    | where OperationName has_any (DeviceOps)
+    | mv-apply T = TargetResources on (summarize TargetUpn = take_anyif(tostring(T.userPrincipalName), tostring(T.type) =~ "User"), TargetDevice = take_anyif(tostring(T.displayName), tostring(T.type) =~ "Device"), TargetDeviceId = take_anyif(tostring(T.id), tostring(T.type) =~ "Device"))
+    | extend RegUser = tolower(coalesce(tostring(InitiatedBy.user.userPrincipalName), TargetUpn)),
+             RegBy = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)),
+             RegIPRaw = tostring(InitiatedBy.user.ipAddress)
+    | summarize RegTime = min(TimeGenerated), RegOps = make_set(OperationName, 5), DeviceName = take_anyif(TargetDevice, isnotempty(TargetDevice)),
+                DeviceObjectId = take_anyif(TargetDeviceId, isnotempty(TargetDeviceId)), RegUserKey = take_anyif(RegUser, isnotempty(RegUser)),
+                RegBy = take_any(RegBy), RegIP = take_anyif(RegIPRaw, isnotempty(RegIPRaw))
+                by CorrelationId
+    | where isnotempty(RegUserKey);
+Registrations
+| join kind=inner CodeEntries on $left.RegUserKey == $right.UserKey
+| where RegTime between (CodeTime .. (CodeTime + follow))
+| join kind=leftouter DrsInSession on SessionId
+| summarize arg_max(CodeTime, *) by CorrelationId                     // the latest code entry before the registration
+| extend MinutesAfterCode = datetime_diff("minute", RegTime, CodeTime),
+         BrokerPath = BrokerToDrs or isnotnull(DrsTokenTime),
+         RegOpList = strcat_array(RegOps, ", ")
+| project TimeGenerated = RegTime, UserPrincipalName, UserId, DeviceName, DeviceObjectId, RegOpList, RegBy, RegIP, CodeTime, CodeIP, CodeApp, CodeAppId,
+          MinutesAfterCode, BrokerPath, DrsTokenIPs, SessionId, CorrelationId

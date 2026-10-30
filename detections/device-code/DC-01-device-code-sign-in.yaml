@@ -1,0 +1,87 @@
+id: 9a3f8c8f-71b9-4ca2-a5cb-b570d23de57e
+name: Device code sign-in
+description: |
+  A user entered a device code. Enriched with client app, owner tenant, location, agent, MFA and CA. Severity rises for the Authentication Broker reaching the Device Registration Service and for third-party apps.
+severity: Low
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+queryFrequency: 1h
+queryPeriod: 2h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+  - CredentialAccess
+relevantTechniques:
+  - T1566.002
+  - T1528
+  - T1078.004
+query: |
+  let alert_window = 1h;
+  // Accounts allowed to use device code. Or: let AllowedUsers = toscalar(_GetWatchlist('DeviceCodeAllowedUsers') | summarize make_list(SearchKey));
+  let AllowedUsers = dynamic([]);
+  // Public clients kits use. Sources and names: docs/devicecode-ttps.md#client-id-lookup
+  let AbusedClients = dynamic(["29d9ed98-a469-4536-ade2-f981bc1d605e", "d3590ed6-52b3-4102-aeff-aad2292ab01c", "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "1950a258-227b-4e31-a9cf-717495945fc2", "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "27922004-5251-4030-b22d-91ecd9a37ea4", "4813382a-8fa7-425e-ab75-3b753aab3abb", "ab9b8c07-8f02-4f72-87fa-80105867a763", "b26aadf8-566f-4478-926f-589f601d9c74", "872cd9fa-d31f-45e0-9eab-6e460a02d1f1", "9ba1a5c7-f17a-4de9-a1f1-6178c8d51223", "14d82eec-204b-4c2f-b7e8-296a70dab67e"]);
+  let BrokerApp = "29d9ed98-a469-4536-ade2-f981bc1d605e";        // Microsoft Authentication Broker
+  let DrsResource = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9";      // Device Registration Service
+  let MicrosoftTenant = "f8cdef31-a31e-4b4a-93e4-5f571e91255a";  // owner of Microsoft first-party apps
+  // 50199 = a confirmation prompt. Followed by success in the same session, it is the pause while a code is entered.
+  let Confirmations = SigninLogs
+      | where TimeGenerated > ago(alert_window + 1h)
+      | where ResultType == "50199"
+      | summarize ConfirmPrompts = count() by SessionId;
+  SigninLogs
+  | where TimeGenerated > ago(alert_window)
+  | where AuthenticationProtocol =~ "deviceCode"
+  | where UserPrincipalName !in~ (AllowedUsers)
+  | join kind=leftouter Confirmations on SessionId
+  | extend Country = tostring(LocationDetails.countryOrRegion), City = tostring(LocationDetails.city),
+           DeviceName = tostring(DeviceDetail.displayName), IsManaged = tostring(DeviceDetail.isManaged), IsCompliant = tostring(DeviceDetail.isCompliant),
+           MfaMethods = strcat_array(extract_all(@'"authenticationMethod":"([^"]+)"', tostring(AuthenticationDetails)), ", "),
+           ConfirmPromptFirst = coalesce(ConfirmPrompts, 0) > 0,
+           BrokerToDrs = AppId == BrokerApp and ResourceId == DrsResource,
+           // Owner tenant neither Microsoft's nor yours: a third-party app. // VERIFY AppOwnerTenantId is populated in your workspace
+           ThirdPartyApp = isnotempty(AppOwnerTenantId) and AppOwnerTenantId != MicrosoftTenant and AppOwnerTenantId != AADTenantId,
+           AbusedClient = AppId in (AbusedClients)
+  | extend ClientKind = case(BrokerToDrs, "Broker to Device Registration Service", ThirdPartyApp, "Third-party app", AbusedClient, "Commonly abused public client", "Other client"),
+           AlertSeverity = case(BrokerToDrs or ThirdPartyApp, "High", ResultType == "0" and (AbusedClient or ConfirmPromptFirst), "Medium", "Low")
+  | project TimeGenerated, AlertSeverity, UserPrincipalName, UserId, ResultType, ResultDescription, ClientKind, AppDisplayName, AppId, AppOwnerTenantId,
+            ResourceDisplayName, ResourceId, IPAddress, AutonomousSystemNumber, Country, City, UserAgent, AuthenticationRequirement, MfaMethods,
+            ConditionalAccessStatus, RiskLevelDuringSignIn, DeviceName, IsManaged, IsCompliant, ConfirmPromptFirst, SessionId, CorrelationId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserPrincipalName
+      - identifier: AadUserId
+        columnName: UserId
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: IPAddress
+  - entityType: CloudApplication
+    fieldMappings:
+      - identifier: Name
+        columnName: AppDisplayName
+customDetails:
+  ClientKind: ClientKind
+  AppId: AppId
+  AppOwnerTenantId: AppOwnerTenantId
+  Resource: ResourceDisplayName
+  ResultType: ResultType
+  ASN: AutonomousSystemNumber
+  Country: Country
+  UserAgent: UserAgent
+  MfaMethods: MfaMethods
+  ConfirmPromptFirst: ConfirmPromptFirst
+  SessionId: SessionId
+alertDetailsOverride:
+  alertDisplayNameFormat: Device code sign-in by {{UserPrincipalName}} ({{ClientKind}})
+  alertDescriptionFormat: '{{UserPrincipalName}} entered a device code for {{AppDisplayName}}. Investigate with docs/devicecode-playbook.md section 5.1.'
+  alertSeverityColumnName: AlertSeverity
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+version: 1.0.0
+kind: Scheduled

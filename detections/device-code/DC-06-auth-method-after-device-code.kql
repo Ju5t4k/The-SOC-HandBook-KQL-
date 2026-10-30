@@ -1,0 +1,43 @@
+//DC-06 Authentication method registered after a device code sign-in
+//
+// Logic:           An authentication method (Authenticator, phone, FIDO2/passkey, Windows Hello, Temporary Access Pass)
+//                  registered, changed or deleted for a user within `follow` of their device code sign-in. Matches on the
+//                  Authentication Methods service as well as the operation names, so new method types are still caught.
+// Tuning:          follow. Removed = true (a method deleted) is kept: attackers remove the victim's method to lock them out.
+//                  If users routinely register Authenticator after a CLI device code login, raise the bar with
+//                  `| where FromOtherIP`.
+// False positives: A user setting up MFA on a new phone the same day they used device code. FromOtherIP = true (the
+//                  registration came from an address other than the code entry's) is the stronger case.
+// Data:            SigninLogs, AuditLogs (Microsoft Entra ID connector).
+// Lookback:        Rule runs every 1h over 2d. Registrations are read for the last hour only.
+// Playbook:        docs/devicecode-playbook.md#55-authentication-methods
+// ATT&CK:          T1098.005, T1556.006
+//
+let alert_window = 1h;
+let follow = 1d;
+// VERIFY the operation names your tenant logs; LoggedByService == "Authentication Methods" catches the rest.
+let AuthOps = dynamic(["security info", "Windows Hello for Business", "passwordless phone sign-in", "Passkey", "FIDO2", "Temporary Access Pass", "authentication method"]);
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | project CodeTime = TimeGenerated, UserKey = tolower(UserPrincipalName), UserPrincipalName, UserId, CodeIP = IPAddress, CodeApp = AppDisplayName, SessionId;
+let MethodChanges = AuditLogs
+    | where TimeGenerated > ago(alert_window)
+    | where LoggedByService =~ "Authentication Methods" or OperationName has_any (AuthOps)
+    | where Result =~ "success"
+    | mv-apply T = TargetResources on (summarize TargetUpn = take_anyif(tostring(T.userPrincipalName), isnotempty(tostring(T.userPrincipalName))))
+    // The victim: the target user when an admin acts, otherwise the user who acted.
+    | extend MethodUser = tolower(coalesce(TargetUpn, tostring(InitiatedBy.user.userPrincipalName))),
+             ChangedBy = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)),
+             ChangeIP = tostring(InitiatedBy.user.ipAddress)
+    | where isnotempty(MethodUser)
+    | project ChangeTime = TimeGenerated, MethodUser, OperationName, ChangedBy, ChangeIP, ResultReason, Detail = tostring(AdditionalDetails), CorrelationId;
+MethodChanges
+| join kind=inner CodeEntries on $left.MethodUser == $right.UserKey
+| where ChangeTime between (CodeTime .. (CodeTime + follow))
+| summarize arg_max(CodeTime, *) by CorrelationId, OperationName
+| extend MinutesAfterCode = datetime_diff("minute", ChangeTime, CodeTime),
+         FromOtherIP = isnotempty(ChangeIP) and ChangeIP != CodeIP,
+         Removed = OperationName has "deleted"
+| project TimeGenerated = ChangeTime, UserPrincipalName, UserId, OperationName, ResultReason, ChangedBy, ChangeIP, FromOtherIP, Removed,
+          CodeTime, CodeIP, CodeApp, MinutesAfterCode, Detail, SessionId, CorrelationId

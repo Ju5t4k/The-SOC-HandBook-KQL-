@@ -1,0 +1,92 @@
+id: 9092377a-6ca7-49cb-8d4b-fa5a90cf2cea
+name: Token replay from a device code session
+description: |
+  Sign-ins in a device code session used another ASN than the code entry, hopped across three or more client apps (FOCI), or carried a scripting user agent.
+severity: High
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+      - AADNonInteractiveUserSignInLogs
+queryFrequency: 1h
+queryPeriod: 2d
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - CredentialAccess
+  - DefenseEvasion
+  - LateralMovement
+relevantTechniques:
+  - T1550.001
+  - T1528
+  - T1078.004
+query: |
+  let alert_window = 1h;
+  let follow = 1d;
+  let FociApps = 3;
+  let KnownEgressAsns = dynamic([]);        // corporate and VPN ASNs, as strings
+  let ToolAgents = @"(?i)(python|aiohttp|requests/|axios|node-fetch|undici|go-http-client|curl/|wget|powershell|okhttp|java/|libwww)";
+  let CodeEntries = SigninLogs
+      | where TimeGenerated > ago(alert_window + follow)
+      | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+      | where isnotempty(SessionId)
+      | summarize arg_min(TimeGenerated, UserPrincipalName, UserId, IPAddress, AutonomousSystemNumber, AppDisplayName) by SessionId
+      | project CodeTime = TimeGenerated, SessionId, UserPrincipalName, CodeUserId = UserId, CodeIP = IPAddress, CodeAsn = tostring(AutonomousSystemNumber), CodeApp = AppDisplayName;
+  let Sessions = CodeEntries | distinct SessionId;
+  let TokenUse = union
+          (AADNonInteractiveUserSignInLogs
+              | where TimeGenerated > ago(alert_window)
+              | where SessionId in (Sessions) or OriginalTransferMethod =~ "deviceCodeFlow"
+              | where ResultType == "0"
+              | project TimeGenerated, SessionId, IPAddress, Asn = tostring(AutonomousSystemNumber), AppId, AppDisplayName, ResourceDisplayName, UserAgent, AuthenticationRequirement, Source = "NonInteractive"),
+          (SigninLogs
+              | where TimeGenerated > ago(alert_window)
+              | where AuthenticationProtocol !~ "deviceCode"
+              | where SessionId in (Sessions) or OriginalTransferMethod =~ "deviceCodeFlow"
+              | where ResultType == "0"
+              | project TimeGenerated, SessionId, IPAddress, Asn = tostring(AutonomousSystemNumber), AppId, AppDisplayName, ResourceDisplayName, UserAgent, AuthenticationRequirement, Source = "Interactive");
+  TokenUse
+  | join kind=inner CodeEntries on SessionId
+  | summarize FirstUse = min(TimeGenerated), LastUse = max(TimeGenerated), Uses = count(), UseIPs = make_set(IPAddress, 20), UseAsns = make_set(Asn, 10),
+              Apps = make_set(AppDisplayName, 20), AppCount = dcount(AppId), Resources = make_set(ResourceDisplayName, 20), Agents = make_set(UserAgent, 10),
+              SingleFactorUses = countif(AuthenticationRequirement =~ "singleFactorAuthentication")
+              by SessionId, UserPrincipalName, CodeUserId, CodeTime, CodeIP, CodeAsn, CodeApp
+  | extend OtherAsns = set_difference(set_difference(UseAsns, pack_array(CodeAsn)), KnownEgressAsns),
+           OtherIPs = set_difference(UseIPs, pack_array(CodeIP))
+  | extend AsnMoved = array_length(OtherAsns) > 0,
+           FociHopping = AppCount >= FociApps,
+           ToolAgent = strcat_array(Agents, " ") matches regex ToolAgents
+  | where AsnMoved or FociHopping or ToolAgent
+  | extend Indicators = strcat_array(set_difference(pack_array(iff(AsnMoved, "token used from another ASN", ""), iff(FociHopping, "FOCI app-hopping", ""), iff(ToolAgent, "tool user agent", "")), dynamic([""])), ", "),
+           ReplayIP = tostring(OtherIPs[0])
+  | project TimeGenerated = FirstUse, UserPrincipalName, UserId = CodeUserId, Indicators, ReplayIP, OtherIPs, OtherAsns, CodeIP, CodeAsn, CodeTime, CodeApp,
+            Apps, AppCount, Resources, Agents, Uses, SingleFactorUses, LastUse, SessionId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserPrincipalName
+      - identifier: AadUserId
+        columnName: UserId
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: ReplayIP
+customDetails:
+  Indicators: Indicators
+  OtherASNs: OtherAsns
+  OtherIPs: OtherIPs
+  CodeIP: CodeIP
+  CodeASN: CodeAsn
+  Apps: Apps
+  AppCount: AppCount
+  Agents: Agents
+  SingleFactorUses: SingleFactorUses
+  SessionId: SessionId
+alertDetailsOverride:
+  alertDisplayNameFormat: 'Device code session of {{UserPrincipalName}} replayed: {{Indicators}}'
+  alertDescriptionFormat: 'Code entered from {{CodeIP}}; token used from {{ReplayIP}}. See docs/devicecode-playbook.md section 5.3.'
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+version: 1.0.0
+kind: Scheduled

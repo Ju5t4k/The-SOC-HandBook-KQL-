@@ -1,0 +1,46 @@
+//DC-01 Device code sign-in
+//
+// Logic:           Every device code code-entry (interactive sign-in, AuthenticationProtocol = deviceCode), successful or not,
+//                  enriched with client app, owner tenant, resource, IP, ASN, location, agent, MFA, CA result and whether
+//                  a 50199 confirmation prompt came first in the same session (the pause while a code is typed).
+//                  Severity rises for the Authentication Broker reaching the Device Registration Service and for third-party apps.
+// Tuning:          AllowedUsers: accounts that use device code legitimately (Teams Rooms resource accounts, CLI users).
+//                  Prefer the watchlist line. Add client IDs your tenant abuses to AbusedClients.
+// False positives: Teams Rooms and other shared devices, Azure CLI / PowerShell / Graph CLI with -UseDeviceCode,
+//                  smart TVs and consoles signing in to Microsoft apps. Recurring user + app + IP is usually legitimate.
+// Data:            SigninLogs (Microsoft Entra ID connector, Entra ID P1/P2 for sign-in logs).
+// Lookback:        Rule runs every 1h over 1h. Volume is low in most tenants; high where Teams Rooms or CLI use is common.
+// Playbook:        docs/devicecode-playbook.md#51-device-code-sign-in
+// ATT&CK:          T1566.002, T1528, T1078.004
+//
+let alert_window = 1h;
+// Accounts allowed to use device code. Or: let AllowedUsers = toscalar(_GetWatchlist('DeviceCodeAllowedUsers') | summarize make_list(SearchKey));
+let AllowedUsers = dynamic([]);
+// Public clients kits use. Sources and names: docs/devicecode-ttps.md#client-id-lookup
+let AbusedClients = dynamic(["29d9ed98-a469-4536-ade2-f981bc1d605e", "d3590ed6-52b3-4102-aeff-aad2292ab01c", "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "1950a258-227b-4e31-a9cf-717495945fc2", "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "27922004-5251-4030-b22d-91ecd9a37ea4", "4813382a-8fa7-425e-ab75-3b753aab3abb", "ab9b8c07-8f02-4f72-87fa-80105867a763", "b26aadf8-566f-4478-926f-589f601d9c74", "872cd9fa-d31f-45e0-9eab-6e460a02d1f1", "9ba1a5c7-f17a-4de9-a1f1-6178c8d51223", "14d82eec-204b-4c2f-b7e8-296a70dab67e"]);
+let BrokerApp = "29d9ed98-a469-4536-ade2-f981bc1d605e";        // Microsoft Authentication Broker
+let DrsResource = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9";      // Device Registration Service
+let MicrosoftTenant = "f8cdef31-a31e-4b4a-93e4-5f571e91255a";  // owner of Microsoft first-party apps
+// 50199 = a confirmation prompt. Followed by success in the same session, it is the pause while a code is entered.
+let Confirmations = SigninLogs
+    | where TimeGenerated > ago(alert_window + 1h)
+    | where ResultType == "50199"
+    | summarize ConfirmPrompts = count() by SessionId;
+SigninLogs
+| where TimeGenerated > ago(alert_window)
+| where AuthenticationProtocol =~ "deviceCode"
+| where UserPrincipalName !in~ (AllowedUsers)
+| join kind=leftouter Confirmations on SessionId
+| extend Country = tostring(LocationDetails.countryOrRegion), City = tostring(LocationDetails.city),
+         DeviceName = tostring(DeviceDetail.displayName), IsManaged = tostring(DeviceDetail.isManaged), IsCompliant = tostring(DeviceDetail.isCompliant),
+         MfaMethods = strcat_array(extract_all(@'"authenticationMethod":"([^"]+)"', tostring(AuthenticationDetails)), ", "),
+         ConfirmPromptFirst = coalesce(ConfirmPrompts, 0) > 0,
+         BrokerToDrs = AppId == BrokerApp and ResourceId == DrsResource,
+         // Owner tenant neither Microsoft's nor yours: a third-party app. // VERIFY AppOwnerTenantId is populated in your workspace
+         ThirdPartyApp = isnotempty(AppOwnerTenantId) and AppOwnerTenantId != MicrosoftTenant and AppOwnerTenantId != AADTenantId,
+         AbusedClient = AppId in (AbusedClients)
+| extend ClientKind = case(BrokerToDrs, "Broker to Device Registration Service", ThirdPartyApp, "Third-party app", AbusedClient, "Commonly abused public client", "Other client"),
+         AlertSeverity = case(BrokerToDrs or ThirdPartyApp, "High", ResultType == "0" and (AbusedClient or ConfirmPromptFirst), "Medium", "Low")
+| project TimeGenerated, AlertSeverity, UserPrincipalName, UserId, ResultType, ResultDescription, ClientKind, AppDisplayName, AppId, AppOwnerTenantId,
+          ResourceDisplayName, ResourceId, IPAddress, AutonomousSystemNumber, Country, City, UserAgent, AuthenticationRequirement, MfaMethods,
+          ConditionalAccessStatus, RiskLevelDuringSignIn, DeviceName, IsManaged, IsCompliant, ConfirmPromptFirst, SessionId, CorrelationId

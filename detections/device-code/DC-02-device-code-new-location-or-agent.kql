@@ -1,0 +1,57 @@
+//DC-02 Device code sign-in from a new IP, ASN, country or user agent
+//
+// Logic:           Successful device code code-entries whose ASN or country the user has not signed in from in the baseline,
+//                  or whose IP and user agent are both new. Baseline = the user's successful interactive and non-interactive
+//                  sign-ins. UEBA first-time insights are added when BehaviorAnalytics exists.
+// Tuning:          baseline (max 13d in a rule; use 30d in the hunting run). Require NewCountry only if travel is common.
+//                  Add corporate egress ASNs to KnownEgressAsns so a new office link does not fire.
+// False positives: New starters (no baseline: NoHistory), travel, new home ISP, mobile carriers changing ASN.
+// Data:            SigninLogs, AADNonInteractiveUserSignInLogs (Microsoft Entra ID connector, Entra ID P1/P2).
+//                  Optional: BehaviorAnalytics (Sentinel UEBA). Missing UEBA does not break the query.
+// Lookback:        Rule runs every 1h over 14d. Non-interactive logs are large: the baseline reads only users with a device
+//                  code sign-in in the last hour, so cost stays proportional to device code volume.
+// Playbook:        docs/devicecode-playbook.md#52-new-location-or-agent
+// ATT&CK:          T1078.004, T1528
+//
+let alert_window = 1h;
+let baseline = 13d;
+let KnownEgressAsns = dynamic([]);        // your corporate and VPN ASNs, as strings
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | extend Asn = tostring(AutonomousSystemNumber), Country = tostring(LocationDetails.countryOrRegion)
+    | project TimeGenerated, UserPrincipalName, UserId, AppDisplayName, AppId, ResourceDisplayName, IPAddress, Asn, Country, UserAgent, SessionId, CorrelationId;
+let Users = CodeEntries | distinct UserId;
+// Project before the union: LocationDetails is dynamic in one table and string in the other.
+let History = union
+        (SigninLogs
+            | where TimeGenerated between (ago(alert_window + baseline) .. ago(alert_window))
+            | where UserId in (Users) and ResultType == "0"
+            | project UserId, IPAddress, Asn = tostring(AutonomousSystemNumber), Country = tostring(LocationDetails.countryOrRegion), UserAgent),
+        (AADNonInteractiveUserSignInLogs
+            | where TimeGenerated between (ago(alert_window + baseline) .. ago(alert_window))
+            | where UserId in (Users) and ResultType == "0"
+            | project UserId, IPAddress, Asn = tostring(AutonomousSystemNumber), Country = tostring(todynamic(LocationDetails).countryOrRegion), UserAgent)
+    | summarize KnownIPs = make_set(IPAddress, 2000), KnownAsns = make_set(Asn, 500), KnownCountries = make_set(Country, 100), KnownAgents = make_set(UserAgent, 1000) by HistUserId = UserId;
+// UEBA insights. The empty datatable keeps the query running where UEBA is off.
+let Ueba = union isfuzzy=true
+        (datatable(UebaUser: string, UebaIP: string, FirstCountryForUser: string, FirstIspForUser: string)[]),
+        (BehaviorAnalytics
+            | where TimeGenerated > ago(alert_window)
+            | where ActionType =~ "Sign-in"
+            // VERIFY: ActivityInsights keys and "True" values against your UEBA data
+            | project UebaUser = tolower(UserPrincipalName), UebaIP = SourceIPAddress, FirstCountryForUser = tostring(ActivityInsights.FirstTimeUserConnectedFromCountry), FirstIspForUser = tostring(ActivityInsights.FirstTimeUserConnectedViaISP))
+    | summarize FirstCountryForUser = take_any(FirstCountryForUser), FirstIspForUser = take_any(FirstIspForUser) by UebaUser, UebaIP;
+CodeEntries
+| join kind=leftouter History on $left.UserId == $right.HistUserId
+| extend NoHistory = isnull(KnownIPs)
+| extend NewIP = not(set_has_element(coalesce(KnownIPs, dynamic([])), IPAddress)),
+         NewAsn = not(set_has_element(coalesce(KnownAsns, dynamic([])), Asn)) and Asn !in (KnownEgressAsns),
+         NewCountry = not(set_has_element(coalesce(KnownCountries, dynamic([])), Country)),
+         NewAgent = not(set_has_element(coalesce(KnownAgents, dynamic([])), UserAgent))
+| extend UserKey = tolower(UserPrincipalName)
+| join kind=leftouter Ueba on $left.UserKey == $right.UebaUser, $left.IPAddress == $right.UebaIP
+| where NoHistory or NewAsn or NewCountry or (NewIP and NewAgent) or FirstCountryForUser =~ "True"
+| extend NewDimensions = strcat_array(set_difference(pack_array(iff(NewIP, "IP", ""), iff(NewAsn, "ASN", ""), iff(NewCountry, "Country", ""), iff(NewAgent, "UserAgent", ""), iff(NoHistory, "NoHistory", "")), dynamic([""])), ", ")
+| project TimeGenerated, UserPrincipalName, UserId, NewDimensions, IPAddress, Asn, Country, UserAgent, AppDisplayName, AppId, ResourceDisplayName,
+          NoHistory, FirstCountryForUser, FirstIspForUser, SessionId, CorrelationId
