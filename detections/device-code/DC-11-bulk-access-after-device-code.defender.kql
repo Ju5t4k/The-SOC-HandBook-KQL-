@@ -1,0 +1,33 @@
+//DC-11 Mass download or mail access after a device code sign-in — Defender XDR Advanced Hunting variant
+//
+// Logic:           File downloads and MailItemsAccessed in CloudAppEvents per user and IP per hour, for users with an
+//                  inferred device code sign-in (50199 then success in one session) in the day before, over thresholds.
+// Tuning:          FileThreshold, MailThreshold.
+// False positives: OneDrive sync of a new device; migration and eDiscovery accounts.
+// Data:            CloudAppEvents (Defender for Cloud Apps, Microsoft 365 app connector), EntraIdSignInEvents (Entra ID P2).
+// Lookback:        2d. For a custom detection rule, run every hour and keep Timestamp and ReportId in the output.
+// Playbook:        docs/devicecode-playbook.md#58-graph-files-and-mail
+// ATT&CK:          T1530, T1213.002, T1114.002
+//
+let lookback = 2d;
+let FileThreshold = 100;
+let MailThreshold = 200;
+let FileOps = dynamic(["FileDownloaded", "FileSyncDownloadedFull", "FileSyncDownloadedPartial"]);
+let CodeSessions = EntraIdSignInEvents
+    | where Timestamp > ago(lookback)
+    | where ErrorCode in (0, 50199)
+    | summarize Codes = make_set(ErrorCode), FirstPrompt = minif(Timestamp, ErrorCode == 50199), CodeTime = minif(Timestamp, ErrorCode == 0)
+                by UserKey = tolower(AccountUpn), SessionId
+    | where set_has_element(Codes, 0) and set_has_element(Codes, 50199) and CodeTime between (FirstPrompt .. (FirstPrompt + 15m))
+    | summarize CodeTime = min(CodeTime) by UserKey;
+CloudAppEvents
+| where Timestamp > ago(lookback)
+| where ActionType in (FileOps) or ActionType == "MailItemsAccessed"
+| extend UserKey = tolower(tostring(RawEventData.UserId))
+| join kind=inner CodeSessions on UserKey
+| where Timestamp >= CodeTime
+| summarize Timestamp = min(Timestamp), ReportId = take_any(ReportId), Downloads = countif(ActionType in (FileOps)), MailAccess = countif(ActionType == "MailItemsAccessed"),
+            SampleItems = make_set(ObjectName, 15)
+            by UserKey, IPAddress, Hour = bin(Timestamp, 1h), CodeTime
+| where Downloads >= FileThreshold or MailAccess >= MailThreshold
+| project Timestamp, ReportId, UserKey, IPAddress, Downloads, MailAccess, SampleItems, CodeTime

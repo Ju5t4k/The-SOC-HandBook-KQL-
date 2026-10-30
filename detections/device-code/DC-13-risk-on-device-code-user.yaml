@@ -1,0 +1,70 @@
+id: 6a1efbd3-8058-4da8-8f77-1999cb98e585
+name: Identity Protection risk on a device code user
+description: |
+  Medium or high risk detection for a user who completed a device code sign-in in the last day, with the user's current risk state and whether the IP matches the code entry.
+severity: Medium
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+      - AADUserRiskEvents
+      - AADRiskyUsers
+queryFrequency: 1h
+queryPeriod: 2d
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+  - CredentialAccess
+relevantTechniques:
+  - T1078.004
+query: |
+  let alert_window = 1h;
+  let follow = 1d;
+  let MinRiskLevel = dynamic(["medium", "high"]);   // add "low" for privileged users
+  let CodeEntries = SigninLogs
+      | where TimeGenerated > ago(alert_window + follow)
+      | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+      | summarize CodeTime = max(TimeGenerated), CodeIPs = make_set(IPAddress, 10) by UserId, UserPrincipalName;
+  let Users = CodeEntries | distinct UserId;
+  let UserRisk = AADRiskyUsers
+      | where TimeGenerated > ago(alert_window + follow)
+      | summarize arg_max(TimeGenerated, RiskLevel, RiskState, RiskDetail) by RiskyUserId = Id
+      | project RiskyUserId, UserRiskLevel = RiskLevel, UserRiskState = RiskState, UserRiskDetail = RiskDetail;
+  AADUserRiskEvents
+  | where TimeGenerated > ago(alert_window)
+  | where UserId in (Users)
+  | where RiskLevel in~ (MinRiskLevel)
+  | project TimeGenerated, RiskTime = ActivityDateTime, UserId, RiskEventType, RiskLevel, RiskState, RiskDetail, RiskIP = IpAddress,
+            RiskCountry = tostring(Location.countryOrRegion), DetectionTimingType, Source, RiskCorrelationId = CorrelationId
+  | join kind=inner CodeEntries on UserId
+  | join kind=leftouter UserRisk on $left.UserId == $right.RiskyUserId
+  | extend SameIP = set_has_element(CodeIPs, RiskIP)
+  | project TimeGenerated, RiskTime, UserPrincipalName, UserId, RiskEventType, RiskLevel, RiskState, RiskDetail, RiskIP, RiskCountry, SameIP,
+            DetectionTimingType, Source, UserRiskLevel, UserRiskState, CodeTime, CodeIPs, RiskCorrelationId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserPrincipalName
+      - identifier: AadUserId
+        columnName: UserId
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RiskIP
+customDetails:
+  RiskEventType: RiskEventType
+  RiskLevel: RiskLevel
+  RiskTime: RiskTime
+  SameIP: SameIP
+  UserRiskLevel: UserRiskLevel
+  UserRiskState: UserRiskState
+  CodeTime: CodeTime
+alertDetailsOverride:
+  alertDisplayNameFormat: '{{RiskEventType}} ({{RiskLevel}}) for device code user {{UserPrincipalName}}'
+  alertDescriptionFormat: 'Risk from {{RiskIP}}. See docs/devicecode-playbook.md section 5.10.'
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+version: 1.0.0
+kind: Scheduled

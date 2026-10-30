@@ -1,0 +1,30 @@
+//DC-09 Mailbox rule or forwarding after a device code sign-in — Defender XDR Advanced Hunting variant
+//
+// Logic:           Exchange rule, forwarding and permission changes in CloudAppEvents by users with an inferred device code
+//                  sign-in (50199 then success in one session) in the day before. Flags rules that forward, delete or move mail.
+// Tuning:          follow. MailOps.
+// False positives: Inbox tidying on the day of a legitimate device code sign-in.
+// Data:            CloudAppEvents (Defender for Cloud Apps, Microsoft 365 app connector), EntraIdSignInEvents (Entra ID P2).
+// Lookback:        2d. For a custom detection rule, run every hour and keep Timestamp and ReportId in the output.
+// Playbook:        docs/devicecode-playbook.md#57-mailbox-rules
+// ATT&CK:          T1114.003, T1564.008
+//
+let lookback = 2d;
+let follow = 1d;
+let MailOps = dynamic(["New-InboxRule", "Set-InboxRule", "Enable-InboxRule", "UpdateInboxRules", "Set-Mailbox", "Add-MailboxPermission", "Add-RecipientPermission", "Set-MailboxFolderPermission", "Add-MailboxFolderPermission"]);
+let CodeSessions = EntraIdSignInEvents
+    | where Timestamp > ago(lookback)
+    | where ErrorCode in (0, 50199)
+    | summarize Codes = make_set(ErrorCode), FirstPrompt = minif(Timestamp, ErrorCode == 50199), CodeTime = minif(Timestamp, ErrorCode == 0),
+                CodeIP = take_anyif(IPAddress, ErrorCode == 0)
+                by UserKey = tolower(AccountUpn), SessionId
+    | where set_has_element(Codes, 0) and set_has_element(Codes, 50199) and CodeTime between (FirstPrompt .. (FirstPrompt + 15m));
+CloudAppEvents
+| where Timestamp > ago(lookback)
+| where ActionType in~ (MailOps)
+| extend UserKey = tolower(tostring(RawEventData.UserId)), Params = tostring(RawEventData.Parameters)
+| join kind=inner CodeSessions on UserKey
+| where Timestamp between (CodeTime .. (CodeTime + follow))
+| summarize arg_max(CodeTime, *) by ReportId
+| extend RuleAction = strcat_array(extract_all(@"(ForwardTo|ForwardAsAttachmentTo|RedirectTo|ForwardingSmtpAddress|ForwardingAddress|DeleteMessage|MoveToFolder|MarkAsRead)", Params), ", ")
+| project Timestamp, ReportId, ActionType, UserKey, RuleAction, Params, IPAddress, CodeTime, CodeIP, SessionId

@@ -1,0 +1,27 @@
+//DC-15 Device code campaign from one IP — Defender XDR Advanced Hunting variant
+//
+// Logic:           Inferred device code sign-ins (50199 then success in one session) grouped by IP; alerts when one IP covers
+//                  MinUsersPerIP users in the day. EntraIdSignInEvents has no ASN column, so the ASN grouping in the Sentinel
+//                  rule has no equivalent here. Failed attempts are invisible to the inference, so this undercounts.
+// Tuning:          MinUsersPerIP, KnownEgressIPs.
+// False positives: A Teams Rooms rollout from one office address.
+// Data:            EntraIdSignInEvents (Entra ID P2). Advanced Hunting, 30 days max.
+// Lookback:        1d. For a custom detection rule, run every hour and keep Timestamp and ReportId in the output.
+// Playbook:        docs/devicecode-playbook.md#512-campaign-scope
+// ATT&CK:          T1566.002, T1078.004, T1090.003
+//
+let lookback = 1d;
+let MinUsersPerIP = 3;
+let KnownEgressIPs = dynamic([]);
+EntraIdSignInEvents
+| where Timestamp > ago(lookback)
+| where ErrorCode in (0, 50199)
+| summarize Codes = make_set(ErrorCode), FirstPrompt = minif(Timestamp, ErrorCode == 50199), CodeTime = minif(Timestamp, ErrorCode == 0),
+            ReportId = take_anyif(ReportId, ErrorCode == 0), IPAddress = take_anyif(IPAddress, ErrorCode == 0), Application = take_any(Application)
+            by AccountUpn, SessionId
+| where set_has_element(Codes, 0) and set_has_element(Codes, 50199) and CodeTime between (FirstPrompt .. (FirstPrompt + 15m))
+| where IPAddress !in (KnownEgressIPs)
+| summarize Timestamp = max(CodeTime), ReportId = take_any(ReportId), Users = dcount(AccountUpn), UserList = make_set(AccountUpn, 50), Apps = make_set(Application, 10), FirstSeen = min(CodeTime)
+            by IPAddress
+| where Users >= MinUsersPerIP
+| project Timestamp, ReportId, IPAddress, Users, UserList, Apps, FirstSeen

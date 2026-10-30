@@ -1,0 +1,45 @@
+//DC-15 Device code campaign: one IP or ASN across several users
+//
+// Logic:           Device code code-entries (any result) over the last day, grouped by IP and by ASN. Alerts when an IP
+//                  reaches MinUsersPerIP users or an ASN reaches MinUsersPerAsn, and a user new to that indicator appeared
+//                  in the last hour, so a campaign raises one alert per new victim rather than one per run.
+// Tuning:          KnownEgressIPs / KnownEgressAsns (offices, VPN, Teams Rooms networks). MinUsersPerIP, MinUsersPerAsn.
+// False positives: A Teams Rooms rollout or a training session where many users sign in with device code from one site.
+//                  Those come from your own egress IPs; exclude them.
+// Data:            SigninLogs (Microsoft Entra ID connector).
+// Lookback:        Rule runs every 1h over 1d. Low volume.
+// Playbook:        docs/devicecode-playbook.md#512-campaign-scope
+// ATT&CK:          T1566.002, T1078.004, T1090.003
+//
+let lookback = 1d;
+let alert_window = 1h;
+let MinUsersPerIP = 3;
+let MinUsersPerAsn = 5;
+let KnownEgressIPs = dynamic([]);
+let KnownEgressAsns = dynamic([]);        // as strings
+let DeviceCode = materialize(SigninLogs
+    | where TimeGenerated > ago(lookback)
+    | where AuthenticationProtocol =~ "deviceCode"
+    | project TimeGenerated, UserPrincipalName, UserId, IPAddress, Asn = tostring(AutonomousSystemNumber), AppDisplayName, ResultType);
+union
+    (DeviceCode
+        | where IPAddress !in (KnownEgressIPs)
+        | summarize FirstByUser = min(TimeGenerated), LastByUser = max(TimeGenerated), Succeeded = max(toint(ResultType == "0")), App = take_any(AppDisplayName), Asn = take_any(Asn)
+                    by Indicator = IPAddress, UserId, UserPrincipalName
+        | summarize Users = dcount(UserId), NewUsers = countif(FirstByUser > ago(alert_window)), SucceededUsers = sum(Succeeded), UserList = make_set(UserPrincipalName, 50),
+                    Apps = make_set(App, 10), Asns = make_set(Asn, 10), FirstSeen = min(FirstByUser), LastSeen = max(LastByUser)
+                    by Indicator
+        | where Users >= MinUsersPerIP
+        | extend IndicatorType = "IP"),
+    (DeviceCode
+        | where Asn !in (KnownEgressAsns)
+        | summarize FirstByUser = min(TimeGenerated), LastByUser = max(TimeGenerated), Succeeded = max(toint(ResultType == "0")), App = take_any(AppDisplayName)
+                    by Indicator = Asn, UserId, UserPrincipalName
+        | summarize Users = dcount(UserId), NewUsers = countif(FirstByUser > ago(alert_window)), SucceededUsers = sum(Succeeded), UserList = make_set(UserPrincipalName, 50),
+                    Apps = make_set(App, 10), FirstSeen = min(FirstByUser), LastSeen = max(LastByUser)
+                    by Indicator
+        | where Users >= MinUsersPerAsn
+        | extend IndicatorType = "ASN")
+| where NewUsers > 0
+| extend IPAddress = iff(IndicatorType == "IP", Indicator, ""), SampleUser = tostring(UserList[0])
+| project TimeGenerated = LastSeen, IndicatorType, Indicator, IPAddress, Users, NewUsers, SucceededUsers, UserList, SampleUser, Apps, Asns, FirstSeen

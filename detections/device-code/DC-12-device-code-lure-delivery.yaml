@@ -1,0 +1,82 @@
+id: fb905cd7-5528-439d-bea5-70a0f820755d
+name: Device code lure delivered or clicked
+description: |
+  A device code URL arrived by mail (link or QR code), Teams message or was clicked. Internal mail with such a URL suggests a compromised sender phishing colleagues.
+severity: Medium
+requiredDataConnectors:
+  - connectorId: MicrosoftThreatProtection
+    dataTypes:
+      - EmailEvents
+      - EmailUrlInfo
+      - UrlClickEvents
+      - MessageEvents
+      - MessageUrlInfo
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+  - LateralMovement
+relevantTechniques:
+  - T1566.002
+  - T1566.003
+  - T1534
+query: |
+  let alert_window = 1h;
+  let LureTerms = dynamic(["devicelogin", "deviceauth"]);
+  let ExcludedSenders = dynamic([]);       // e.g. your IT announcements address
+  let IncludeSubjectLures = false;
+  let SubjectPattern = @"(?i)(device code|verification code|enter (the|this) code|meeting (id|code)|authenticate your device|secure (document|message))";
+  union isfuzzy=true
+      (EmailUrlInfo
+          | where TimeGenerated > ago(alert_window)
+          | where Url has_any (LureTerms)
+          | join kind=inner (EmailEvents | where TimeGenerated > ago(alert_window) | project NetworkMessageId, Recipient = RecipientEmailAddress, Sender = SenderFromAddress, Subject, EmailDirection, DeliveryAction, DeliveryLocation, SenderIP = SenderIPv4) on NetworkMessageId
+          | extend Kind = case(EmailDirection =~ "Intra-org", "Internal mail (possible compromised sender)", UrlLocation =~ "QRCode", "Mail QR code", "Mail link")
+          | project TimeGenerated, Kind, Recipient, Sender, Subject, Url, DeliveryAction, DeliveryLocation, SenderIP, MessageId = NetworkMessageId),
+      (MessageUrlInfo
+          | where TimeGenerated > ago(alert_window)
+          | where Url has_any (LureTerms)
+          | join kind=inner (MessageEvents | where TimeGenerated > ago(alert_window) | mv-expand Rcpt = RecipientDetails | project TeamsMessageId, Recipient = tostring(Rcpt.RecipientSmtpAddress), Sender = SenderEmailAddress, Subject = MessageSubject, IsExternalThread, DeliveryAction, DeliveryLocation) on TeamsMessageId
+          | extend Kind = iff(IsExternalThread, "External Teams message", "Internal Teams message")
+          | project TimeGenerated, Kind, Recipient, Sender, Subject, Url, DeliveryAction, DeliveryLocation, MessageId = TeamsMessageId),
+      (UrlClickEvents
+          | where TimeGenerated > ago(alert_window)
+          | where Url has_any (LureTerms) or UrlChain has_any (LureTerms)
+          | project TimeGenerated, Kind = strcat("Click (", ActionType, ")"), Recipient = AccountUpn, Url, SenderIP = IPAddress, MessageId = NetworkMessageId),
+      (EmailEvents
+          | where IncludeSubjectLures
+          | where TimeGenerated > ago(alert_window)
+          | where EmailDirection =~ "Inbound" and UrlCount > 0
+          | where Subject matches regex SubjectPattern
+          | project TimeGenerated, Kind = "Code-style subject", Recipient = RecipientEmailAddress, Sender = SenderFromAddress, Subject, DeliveryAction, DeliveryLocation, SenderIP = SenderIPv4, MessageId = NetworkMessageId)
+  | where Sender !in~ (ExcludedSenders)
+  | project TimeGenerated, Kind, Recipient, Sender, Subject, Url, DeliveryAction, DeliveryLocation, SenderIP, MessageId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Recipient
+  - entityType: URL
+    fieldMappings:
+      - identifier: Url
+        columnName: Url
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SenderIP
+customDetails:
+  Kind: Kind
+  Sender: Sender
+  Subject: Subject
+  DeliveryAction: DeliveryAction
+  DeliveryLocation: DeliveryLocation
+  MessageId: MessageId
+alertDetailsOverride:
+  alertDisplayNameFormat: 'Device code lure ({{Kind}}) to {{Recipient}}'
+  alertDescriptionFormat: 'From {{Sender}}. Check whether the recipient then signed in with device code (DC-01). See docs/devicecode-playbook.md section 5.9.'
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+version: 1.0.0
+kind: Scheduled

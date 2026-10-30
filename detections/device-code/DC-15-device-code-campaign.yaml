@@ -1,0 +1,77 @@
+id: e099e8bf-273e-4ca7-9877-aee04bc216ca
+name: Device code campaign from one IP or ASN
+description: |
+  One IP (3+ users) or ASN (5+ users) used for device code sign-ins across several users in a day, with a new user in the last hour. Fires once per new victim.
+severity: High
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+queryFrequency: 1h
+queryPeriod: 1d
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+  - ResourceDevelopment
+relevantTechniques:
+  - T1566.002
+  - T1078.004
+  - T1090.003
+query: |
+  let lookback = 1d;
+  let alert_window = 1h;
+  let MinUsersPerIP = 3;
+  let MinUsersPerAsn = 5;
+  let KnownEgressIPs = dynamic([]);
+  let KnownEgressAsns = dynamic([]);        // as strings
+  let DeviceCode = materialize(SigninLogs
+      | where TimeGenerated > ago(lookback)
+      | where AuthenticationProtocol =~ "deviceCode"
+      | project TimeGenerated, UserPrincipalName, UserId, IPAddress, Asn = tostring(AutonomousSystemNumber), AppDisplayName, ResultType);
+  union
+      (DeviceCode
+          | where IPAddress !in (KnownEgressIPs)
+          | summarize FirstByUser = min(TimeGenerated), LastByUser = max(TimeGenerated), Succeeded = max(toint(ResultType == "0")), App = take_any(AppDisplayName), Asn = take_any(Asn)
+                      by Indicator = IPAddress, UserId, UserPrincipalName
+          | summarize Users = dcount(UserId), NewUsers = countif(FirstByUser > ago(alert_window)), SucceededUsers = sum(Succeeded), UserList = make_set(UserPrincipalName, 50),
+                      Apps = make_set(App, 10), Asns = make_set(Asn, 10), FirstSeen = min(FirstByUser), LastSeen = max(LastByUser)
+                      by Indicator
+          | where Users >= MinUsersPerIP
+          | extend IndicatorType = "IP"),
+      (DeviceCode
+          | where Asn !in (KnownEgressAsns)
+          | summarize FirstByUser = min(TimeGenerated), LastByUser = max(TimeGenerated), Succeeded = max(toint(ResultType == "0")), App = take_any(AppDisplayName)
+                      by Indicator = Asn, UserId, UserPrincipalName
+          | summarize Users = dcount(UserId), NewUsers = countif(FirstByUser > ago(alert_window)), SucceededUsers = sum(Succeeded), UserList = make_set(UserPrincipalName, 50),
+                      Apps = make_set(App, 10), FirstSeen = min(FirstByUser), LastSeen = max(LastByUser)
+                      by Indicator
+          | where Users >= MinUsersPerAsn
+          | extend IndicatorType = "ASN")
+  | where NewUsers > 0
+  | extend IPAddress = iff(IndicatorType == "IP", Indicator, ""), SampleUser = tostring(UserList[0])
+  | project TimeGenerated = LastSeen, IndicatorType, Indicator, IPAddress, Users, NewUsers, SucceededUsers, UserList, SampleUser, Apps, Asns, FirstSeen
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: IPAddress
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: SampleUser
+customDetails:
+  IndicatorType: IndicatorType
+  Indicator: Indicator
+  Users: Users
+  NewUsers: NewUsers
+  SucceededUsers: SucceededUsers
+  UserList: UserList
+  Apps: Apps
+alertDetailsOverride:
+  alertDisplayNameFormat: 'Device code campaign: {{IndicatorType}} {{Indicator}} across {{Users}} users'
+  alertDescriptionFormat: 'Scope every user in UserList with docs/devicecode-playbook.md section 5.12.'
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+version: 1.0.0
+kind: Scheduled

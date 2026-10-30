@@ -1,0 +1,36 @@
+//DC-14b Conditional Access posture for device code flow
+//
+// Logic:           Rebuilds the latest definition of every Conditional Access policy from its last create/update audit
+//                  record, and lists those whose authentication-flows condition targets device code flow: whether they
+//                  are on, whether they block, and who and what they exclude. ExcludesDrs flags an exclusion of the
+//                  Device Registration Service, the path the Authentication Broker technique uses.
+// Tuning:          Hunting query: set the time range in the Hunting blade to your full AuditLogs retention. A policy not
+//                  changed within retention does not appear: export it with Get-MgIdentityConditionalAccessPolicy
+//                  (docs/devicecode-playbook.md section 8). Empty output means no device code policy changed in range.
+// False positives: None; this is posture. Read ExcludedUsers/Groups against your approved exception list.
+// Data:            AuditLogs (Microsoft Entra ID connector). VERIFY: the policy JSON in modifiedProperties uses the
+//                  Graph property names (conditions.authenticationFlows.transferMethods, grantControls.builtInControls).
+// Lookback:        Whatever the Hunting blade is set to; reads only Conditional Access audit events, so cost is low.
+// Playbook:        docs/devicecode-playbook.md#511-conditional-access-gap
+// ATT&CK:          T1556.009
+//
+let DrsResource = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9";      // Device Registration Service
+AuditLogs
+| where OperationName in ("Add conditional access policy", "Update conditional access policy", "Delete conditional access policy")
+| where Result =~ "success"
+| extend PolicyId = tostring(TargetResources[0].id), PolicyName = tostring(TargetResources[0].displayName),
+         ChangedBy = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))
+| mv-apply MP = TargetResources[0].modifiedProperties on (summarize PolicyJson = take_anyif(tostring(MP.newValue), tostring(MP.displayName) == "ConditionalAccessPolicy"))
+| summarize arg_max(TimeGenerated, OperationName, PolicyName, PolicyJson, ChangedBy) by PolicyId
+| where OperationName != "Delete conditional access policy"
+| extend Policy = parse_json(PolicyJson)
+| extend State = tostring(Policy.state),
+         TransferMethods = tostring(Policy.conditions.authenticationFlows.transferMethods),
+         GrantControls = tostring(Policy.grantControls.builtInControls),
+         ExcludedUsers = Policy.conditions.users.excludeUsers, ExcludedGroups = Policy.conditions.users.excludeGroups,
+         ExcludedRoles = Policy.conditions.users.excludeRoles, IncludedApps = Policy.conditions.applications.includeApplications,
+         ExcludedApps = Policy.conditions.applications.excludeApplications
+| where TransferMethods has "deviceCodeFlow"
+| extend Enforced = State =~ "enabled", Blocks = GrantControls has "block", ExcludesDrs = tostring(ExcludedApps) has DrsResource
+| project PolicyName, PolicyId, State, Enforced, Blocks, ExcludesDrs, ExcludedUsers, ExcludedGroups, ExcludedRoles, IncludedApps, ExcludedApps,
+          LastChanged = TimeGenerated, ChangedBy

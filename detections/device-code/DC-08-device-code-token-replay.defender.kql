@@ -1,0 +1,38 @@
+//DC-08 Token replay from a device code session — Defender XDR Advanced Hunting variant
+//
+// Logic:           Sessions with an inferred device code sign-in (50199 then success), then every successful sign-in in the
+//                  same SessionId (EntraIdSignInEvents holds interactive and non-interactive). Flags another country or IP
+//                  than the code entry, three or more applications (FOCI hopping), or a scripting user agent.
+//                  Weaker than the Sentinel rule: EntraIdSignInEvents has no ASN column and no OriginalTransferMethod.
+// Tuning:          FociApps. KnownEgressIPs. ToolAgents.
+// False positives: Roaming between office and home inside a session; Azure CLI's python user agent.
+// Data:            EntraIdSignInEvents (Entra ID P2). Advanced Hunting, 30 days max.
+// Lookback:        2d. For a custom detection rule, run every hour and keep Timestamp and ReportId in the output.
+// Playbook:        docs/devicecode-playbook.md#53-token-replay
+// ATT&CK:          T1550.001, T1528, T1078.004
+//
+let lookback = 2d;
+let FociApps = 3;
+let KnownEgressIPs = dynamic([]);
+let ToolAgents = @"(?i)(python|aiohttp|requests/|axios|node-fetch|undici|go-http-client|curl/|wget|powershell|okhttp|java/|libwww)";
+let CodeSessions = EntraIdSignInEvents
+    | where Timestamp > ago(lookback)
+    | where ErrorCode in (0, 50199)
+    | summarize Codes = make_set(ErrorCode), FirstPrompt = minif(Timestamp, ErrorCode == 50199), CodeTime = minif(Timestamp, ErrorCode == 0),
+                CodeIP = take_anyif(IPAddress, ErrorCode == 0), CodeCountry = take_anyif(Country, ErrorCode == 0)
+                by AccountUpn, SessionId
+    | where set_has_element(Codes, 0) and set_has_element(Codes, 50199) and CodeTime between (FirstPrompt .. (FirstPrompt + 15m));
+EntraIdSignInEvents
+| where Timestamp > ago(lookback)
+| where ErrorCode == 0
+| where SessionId in ((CodeSessions | project SessionId))
+| join kind=inner CodeSessions on SessionId
+| where Timestamp >= CodeTime
+| summarize Timestamp = min(Timestamp), ReportId = take_any(ReportId), IPs = make_set(IPAddress, 20), Countries = make_set(Country, 10),
+            AppCount = dcount(ApplicationId), Apps = make_set(Application, 20), Agents = make_set(UserAgent, 10)
+            by AccountUpn, SessionId, CodeTime, CodeIP, CodeCountry
+| extend OtherIPs = set_difference(set_difference(IPs, pack_array(CodeIP)), KnownEgressIPs), OtherCountries = set_difference(Countries, pack_array(CodeCountry))
+| extend Moved = array_length(OtherCountries) > 0 or array_length(OtherIPs) > 0, FociHopping = AppCount >= FociApps,
+         ToolAgent = strcat_array(Agents, " ") matches regex ToolAgents
+| where array_length(OtherCountries) > 0 or FociHopping or ToolAgent
+| project Timestamp, ReportId, AccountUpn, Moved, OtherCountries, OtherIPs, FociHopping, AppCount, Apps, ToolAgent, Agents, CodeIP, CodeCountry, CodeTime, SessionId

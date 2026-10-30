@@ -1,0 +1,31 @@
+//DC-07 App consent or credential after a device code sign-in — Defender XDR Advanced Hunting variant
+//
+// Logic:           Entra app operations in CloudAppEvents (consent, permission grants, app roles, service principals,
+//                  credentials, owners) by users with an inferred device code sign-in (50199 then success in one session)
+//                  in the day before.
+// Tuning:          follow. Entra operations arrive in CloudAppEvents with a trailing full stop ("Consent to application.");
+//                  the startswith match covers both forms. // VERIFY ActionType spelling in your tenant
+// False positives: Add-in consent on the day of a legitimate device code sign-in.
+// Data:            CloudAppEvents (Defender for Cloud Apps, Microsoft 365 app connector), EntraIdSignInEvents (Entra ID P2).
+// Lookback:        2d. For a custom detection rule, run every hour and keep Timestamp and ReportId in the output.
+// Playbook:        docs/devicecode-playbook.md#56-apps-and-consent
+// ATT&CK:          T1528, T1098.001, T1671
+//
+let lookback = 2d;
+let follow = 1d;
+let AppOps = dynamic(["Consent to application", "Add delegated permission grant", "Add app role assignment", "Add service principal", "Add application", "Update application", "Add owner to application", "Add owner to service principal"]);
+let CodeSessions = EntraIdSignInEvents
+    | where Timestamp > ago(lookback)
+    | where ErrorCode in (0, 50199)
+    | summarize Codes = make_set(ErrorCode), FirstPrompt = minif(Timestamp, ErrorCode == 50199), CodeTime = minif(Timestamp, ErrorCode == 0),
+                CodeIP = take_anyif(IPAddress, ErrorCode == 0), CodeApp = take_any(Application)
+                by UserKey = tolower(AccountUpn), SessionId
+    | where set_has_element(Codes, 0) and set_has_element(Codes, 50199) and CodeTime between (FirstPrompt .. (FirstPrompt + 15m));
+CloudAppEvents
+| where Timestamp > ago(lookback)
+| where ActionType has_any (AppOps)
+| extend UserKey = tolower(tostring(RawEventData.UserId)), Target = tostring(RawEventData.Target), Props = tostring(RawEventData.ModifiedProperties)
+| join kind=inner CodeSessions on UserKey
+| where Timestamp between (CodeTime .. (CodeTime + follow))
+| summarize arg_max(CodeTime, *) by ReportId
+| project Timestamp, ReportId, ActionType, UserKey, ObjectName, Target, Props, IPAddress, CodeTime, CodeIP, CodeApp, SessionId

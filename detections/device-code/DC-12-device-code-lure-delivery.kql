@@ -1,0 +1,47 @@
+//DC-12 Device code lure delivered or clicked
+//
+// Logic:           Messages and clicks carrying a device code URL (microsoft.com/devicelogin, aka.ms/devicelogin,
+//                  login.microsoftonline.com/.../deviceauth): mail links, URLs decoded from QR codes, external Teams
+//                  messages, and Safe Links clicks. Internal mail with these URLs is flagged: it is the attacker phishing
+//                  colleagues from a compromised mailbox. An optional leg adds external mail with code-style subjects.
+// Tuning:          IncludeSubjectLures (off by default, noisier). SubjectPattern. Exclude your own IT announcements
+//                  by sender in ExcludedSenders.
+// False positives: IT instructions for Teams Rooms or TV sign-in; vendor documentation. Internal senders other than IT,
+//                  and any external sender, deserve a look.
+// Data:            EmailEvents, EmailUrlInfo, UrlClickEvents (Defender for Office 365 Plan 2 via the Microsoft Defender XDR
+//                  connector). MessageEvents, MessageUrlInfo (Defender for Office 365 Teams protection). // VERIFY the Teams
+//                  tables are enabled in your connector; the query runs without them.
+// Lookback:        Rule runs every 1h over 1h. Volume: low; only URLs containing the device code terms are read.
+// Playbook:        docs/devicecode-playbook.md#59-lure-delivery
+// ATT&CK:          T1566.002, T1566.003, T1534
+//
+let alert_window = 1h;
+let LureTerms = dynamic(["devicelogin", "deviceauth"]);
+let ExcludedSenders = dynamic([]);       // e.g. your IT announcements address
+let IncludeSubjectLures = false;
+let SubjectPattern = @"(?i)(device code|verification code|enter (the|this) code|meeting (id|code)|authenticate your device|secure (document|message))";
+union isfuzzy=true
+    (EmailUrlInfo
+        | where TimeGenerated > ago(alert_window)
+        | where Url has_any (LureTerms)
+        | join kind=inner (EmailEvents | where TimeGenerated > ago(alert_window) | project NetworkMessageId, Recipient = RecipientEmailAddress, Sender = SenderFromAddress, Subject, EmailDirection, DeliveryAction, DeliveryLocation, SenderIP = SenderIPv4) on NetworkMessageId
+        | extend Kind = case(EmailDirection =~ "Intra-org", "Internal mail (possible compromised sender)", UrlLocation =~ "QRCode", "Mail QR code", "Mail link")
+        | project TimeGenerated, Kind, Recipient, Sender, Subject, Url, DeliveryAction, DeliveryLocation, SenderIP, MessageId = NetworkMessageId),
+    (MessageUrlInfo
+        | where TimeGenerated > ago(alert_window)
+        | where Url has_any (LureTerms)
+        | join kind=inner (MessageEvents | where TimeGenerated > ago(alert_window) | mv-expand Rcpt = RecipientDetails | project TeamsMessageId, Recipient = tostring(Rcpt.RecipientSmtpAddress), Sender = SenderEmailAddress, Subject = MessageSubject, IsExternalThread, DeliveryAction, DeliveryLocation) on TeamsMessageId
+        | extend Kind = iff(IsExternalThread, "External Teams message", "Internal Teams message")
+        | project TimeGenerated, Kind, Recipient, Sender, Subject, Url, DeliveryAction, DeliveryLocation, MessageId = TeamsMessageId),
+    (UrlClickEvents
+        | where TimeGenerated > ago(alert_window)
+        | where Url has_any (LureTerms) or UrlChain has_any (LureTerms)
+        | project TimeGenerated, Kind = strcat("Click (", ActionType, ")"), Recipient = AccountUpn, Url, SenderIP = IPAddress, MessageId = NetworkMessageId),
+    (EmailEvents
+        | where IncludeSubjectLures
+        | where TimeGenerated > ago(alert_window)
+        | where EmailDirection =~ "Inbound" and UrlCount > 0
+        | where Subject matches regex SubjectPattern
+        | project TimeGenerated, Kind = "Code-style subject", Recipient = RecipientEmailAddress, Sender = SenderFromAddress, Subject, DeliveryAction, DeliveryLocation, SenderIP = SenderIPv4, MessageId = NetworkMessageId)
+| where Sender !in~ (ExcludedSenders)
+| project TimeGenerated, Kind, Recipient, Sender, Subject, Url, DeliveryAction, DeliveryLocation, SenderIP, MessageId

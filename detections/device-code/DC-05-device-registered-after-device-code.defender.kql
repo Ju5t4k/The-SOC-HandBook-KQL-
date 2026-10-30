@@ -1,0 +1,33 @@
+//DC-05 Device registered after a device code sign-in — Defender XDR Advanced Hunting variant
+//
+// Logic:           Device registrations logged by the Device Registration Service in CloudAppEvents (field extraction from
+//                  Microsoft's Storm-2372 hunting query), for users with an inferred device code sign-in (50199 then
+//                  success in one session) in the day before. ToDrs marks a sign-in to the Device Registration Service itself.
+// Tuning:          follow. The ModifiedProperties positions come from Microsoft's published query. // VERIFY on one known
+//                  registration in your tenant before relying on DeviceName and DeviceId.
+// False positives: New phone or PC enrolment on the day of a legitimate device code sign-in.
+// Data:            CloudAppEvents (Defender for Cloud Apps, Microsoft 365 app connector), EntraIdSignInEvents (Entra ID P2).
+// Lookback:        2d. For a custom detection rule, run every hour and keep Timestamp and ReportId in the output.
+// Playbook:        docs/devicecode-playbook.md#54-device-registration
+// ATT&CK:          T1098.005
+//
+let lookback = 2d;
+let follow = 1d;
+let DrsResource = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9";
+let CodeSessions = EntraIdSignInEvents
+    | where Timestamp > ago(lookback)
+    | where ErrorCode in (0, 50199)
+    | summarize Codes = make_set(ErrorCode), FirstPrompt = minif(Timestamp, ErrorCode == 50199), CodeTime = minif(Timestamp, ErrorCode == 0),
+                CodeIP = take_anyif(IPAddress, ErrorCode == 0), CodeApp = take_any(Application), ToDrs = max(toint(ResourceId == DrsResource))
+                by UserKey = tolower(AccountUpn), SessionId
+    | where set_has_element(Codes, 0) and set_has_element(Codes, 50199) and CodeTime between (FirstPrompt .. (FirstPrompt + 15m));
+CloudAppEvents
+| where Timestamp > ago(lookback)
+| where AccountDisplayName == "Device Registration Service"
+| extend Props = parse_json(tostring(RawEventData.ModifiedProperties))
+| extend DeviceName = tostring(Props[1].NewValue), DeviceId = tostring(parse_json(tostring(Props[6].NewValue))[0]), DeviceObjectId = tostring(Props[0].NewValue),
+         UserKey = tolower(tostring(RawEventData.ObjectId))
+| join kind=inner CodeSessions on UserKey
+| where Timestamp between (CodeTime .. (CodeTime + follow))
+| summarize arg_max(CodeTime, *) by ReportId
+| project Timestamp, ReportId, ActionType, UserKey, DeviceName, DeviceId, DeviceObjectId, CodeTime, CodeIP, CodeApp, ToDrs, SessionId

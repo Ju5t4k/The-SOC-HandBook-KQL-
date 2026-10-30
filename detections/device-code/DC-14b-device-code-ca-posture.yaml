@@ -1,0 +1,34 @@
+id: 32075ca4-879c-4aaa-8afc-b25eefad470a
+name: Conditional Access posture for device code flow
+description: |
+  Latest definition of each Conditional Access policy that targets device code flow, rebuilt from audit records: state, block, exclusions, and whether the Device Registration Service is excluded.
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - AuditLogs
+tactics:
+  - DefenseEvasion
+relevantTechniques:
+  - T1556.009
+query: |
+  let DrsResource = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9";      // Device Registration Service
+  AuditLogs
+  | where OperationName in ("Add conditional access policy", "Update conditional access policy", "Delete conditional access policy")
+  | where Result =~ "success"
+  | extend PolicyId = tostring(TargetResources[0].id), PolicyName = tostring(TargetResources[0].displayName),
+           ChangedBy = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))
+  | mv-apply MP = TargetResources[0].modifiedProperties on (summarize PolicyJson = take_anyif(tostring(MP.newValue), tostring(MP.displayName) == "ConditionalAccessPolicy"))
+  | summarize arg_max(TimeGenerated, OperationName, PolicyName, PolicyJson, ChangedBy) by PolicyId
+  | where OperationName != "Delete conditional access policy"
+  | extend Policy = parse_json(PolicyJson)
+  | extend State = tostring(Policy.state),
+           TransferMethods = tostring(Policy.conditions.authenticationFlows.transferMethods),
+           GrantControls = tostring(Policy.grantControls.builtInControls),
+           ExcludedUsers = Policy.conditions.users.excludeUsers, ExcludedGroups = Policy.conditions.users.excludeGroups,
+           ExcludedRoles = Policy.conditions.users.excludeRoles, IncludedApps = Policy.conditions.applications.includeApplications,
+           ExcludedApps = Policy.conditions.applications.excludeApplications
+  | where TransferMethods has "deviceCodeFlow"
+  | extend Enforced = State =~ "enabled", Blocks = GrantControls has "block", ExcludesDrs = tostring(ExcludedApps) has DrsResource
+  | project PolicyName, PolicyId, State, Enforced, Blocks, ExcludesDrs, ExcludedUsers, ExcludedGroups, ExcludedRoles, IncludedApps, ExcludedApps,
+            LastChanged = TimeGenerated, ChangedBy
+version: 1.0.0

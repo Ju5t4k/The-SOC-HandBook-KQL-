@@ -1,0 +1,82 @@
+id: 71e96fc2-0e3d-4f63-a4aa-d38d52d88904
+name: Graph API abuse after device code sign-in
+description: |
+  A user with a device code sign-in in the last day made bulk directory, mail or file reads, a search call, or used a scripting user agent against Microsoft Graph.
+severity: Medium
+requiredDataConnectors:
+  - connectorId: AzureActiveDirectory
+    dataTypes:
+      - SigninLogs
+      - MicrosoftGraphActivityLogs
+queryFrequency: 1h
+queryPeriod: 2d
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Discovery
+  - Collection
+relevantTechniques:
+  - T1087.004
+  - T1069.003
+  - T1526
+  - T1114.002
+query: |
+  let alert_window = 1h;
+  let follow = 1d;
+  let EnumThreshold = 50;                   // directory reads (users, groups, apps, roles) in an hour
+  let MailThreshold = 100;                  // mailbox reads in an hour
+  let FileThreshold = 100;                  // drive and site reads in an hour
+  let ToolAgents = @"(?i)(python|aiohttp|requests/|axios|node-fetch|undici|go-http-client|curl/|wget|powershell|okhttp|java/|libwww)";
+  let CodeEntries = SigninLogs
+      | where TimeGenerated > ago(alert_window + follow)
+      | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+      | summarize CodeTime = max(TimeGenerated), CodeSessions = make_set(SessionId, 20), CodeIPs = make_set(IPAddress, 10) by UserId, UserPrincipalName;
+  let Users = CodeEntries | distinct UserId;
+  MicrosoftGraphActivityLogs
+  | where TimeGenerated > ago(alert_window)
+  | where UserId in (Users)
+  | extend Path = tolower(tostring(parse_url(RequestUri).Path))
+  | extend Kind = case(Path matches regex @"/(users|groups|directoryobjects|applications|serviceprincipals|rolemanagement|directoryroles|devices|organization)(/|$|\?)", "Directory",
+                       Path has_any ("messages", "mailfolders", "mailboxsettings"), "Mail",
+                       Path has_any ("drives", "driveitems", "sites"), "Files",
+                       "Other"),
+           IsSearch = RequestUri has "$search" or Path has "/search/query"
+  | summarize FirstCall = min(TimeGenerated), Calls = count(), DirectoryReads = countif(Kind == "Directory"), MailReads = countif(Kind == "Mail"),
+              FileReads = countif(Kind == "Files"), Searches = countif(IsSearch), Failed = countif(ResponseStatusCode >= 400),
+              Agents = make_set(UserAgent, 5), Apps = make_set(AppId, 5), SamplePaths = make_set(Path, 15)
+              by UserId, IPAddress, SessionId
+  | join kind=inner CodeEntries on UserId
+  | extend ToolAgent = strcat_array(Agents, " ") matches regex ToolAgents,
+           SameSession = set_has_element(CodeSessions, SessionId)
+  | where DirectoryReads >= EnumThreshold or MailReads >= MailThreshold or FileReads >= FileThreshold or Searches > 0 or ToolAgent
+  | extend Behaviour = strcat_array(set_difference(pack_array(iff(DirectoryReads >= EnumThreshold, "directory enumeration", ""), iff(MailReads >= MailThreshold, "bulk mail reads", ""), iff(FileReads >= FileThreshold, "bulk file reads", ""), iff(Searches > 0, "search", ""), iff(ToolAgent, "tool user agent", "")), dynamic([""])), ", ")
+  | project TimeGenerated = FirstCall, UserPrincipalName, UserId, IPAddress, Behaviour, Calls, DirectoryReads, MailReads, FileReads, Searches, Failed,
+            Agents, Apps, SamplePaths, SameSession, CodeTime, CodeIPs, SessionId
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserPrincipalName
+      - identifier: AadUserId
+        columnName: UserId
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: IPAddress
+customDetails:
+  Behaviour: Behaviour
+  Calls: Calls
+  DirectoryReads: DirectoryReads
+  MailReads: MailReads
+  FileReads: FileReads
+  Searches: Searches
+  Agents: Agents
+  SameSession: SameSession
+  SessionId: SessionId
+alertDetailsOverride:
+  alertDisplayNameFormat: 'Graph {{Behaviour}} by {{UserPrincipalName}} after a device code sign-in'
+  alertDescriptionFormat: '{{Calls}} Graph calls from {{IPAddress}}. See docs/devicecode-playbook.md section 5.8.'
+eventGroupingSettings:
+  aggregationKind: AlertPerResult
+version: 1.0.0
+kind: Scheduled

@@ -1,0 +1,40 @@
+//DC-01 Device code sign-in — Defender XDR Advanced Hunting variant
+//
+// Logic:           EntraIdSignInEvents has no AuthenticationProtocol column, so a device code sign-in is inferred: a 50199
+//                  confirmation prompt followed by success in the same session within 15 minutes (the pattern Microsoft
+//                  uses in its Storm-2372 hunting query). LureClicked adds a Safe Links click on a device code URL by the
+//                  same user in the 10 minutes before. Weaker than the Sentinel rule: 50199 also precedes some other flows.
+// Tuning:          AbusedClients. Check EndpointCall on a known device code sign-in in your tenant; if it marks device
+//                  code, filter on it instead. // VERIFY
+// False positives: Other flows that show a 50199 confirmation; legitimate device code use (Teams Rooms, CLI).
+// Data:            EntraIdSignInEvents (Entra ID P2), UrlClickEvents (Defender for Office 365 P2). Advanced Hunting, 30 days max.
+// Lookback:        1d. For a custom detection rule, run every hour and keep Timestamp and ReportId in the output.
+// Playbook:        docs/devicecode-playbook.md#51-device-code-sign-in
+// ATT&CK:          T1566.002, T1528, T1078.004
+//
+let lookback = 1d;
+let AbusedClients = dynamic(["29d9ed98-a469-4536-ade2-f981bc1d605e", "d3590ed6-52b3-4102-aeff-aad2292ab01c", "04b07795-8ddb-461a-bbee-02f9e1bf7b46", "1950a258-227b-4e31-a9cf-717495945fc2", "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "27922004-5251-4030-b22d-91ecd9a37ea4", "4813382a-8fa7-425e-ab75-3b753aab3abb", "ab9b8c07-8f02-4f72-87fa-80105867a763", "b26aadf8-566f-4478-926f-589f601d9c74", "872cd9fa-d31f-45e0-9eab-6e460a02d1f1", "9ba1a5c7-f17a-4de9-a1f1-6178c8d51223", "14d82eec-204b-4c2f-b7e8-296a70dab67e"]);
+let DrsResource = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9";
+let LureClicks = UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where UrlChain has_any ("microsoft.com/devicelogin", "login.microsoftonline.com/common/oauth2/deviceauth") or Url has_any ("devicelogin", "deviceauth")
+    | project ClickTime = Timestamp, ClickUser = tolower(AccountUpn), ClickUrl = Url;
+EntraIdSignInEvents
+| where Timestamp > ago(lookback)
+| where ErrorCode in (0, 50199)
+| summarize Codes = make_set(ErrorCode), FirstPrompt = minif(Timestamp, ErrorCode == 50199), Timestamp = minif(Timestamp, ErrorCode == 0),
+            ReportId = take_anyif(ReportId, ErrorCode == 0), IPAddress = take_anyif(IPAddress, ErrorCode == 0), Country = take_anyif(Country, ErrorCode == 0),
+            UserAgent = take_anyif(UserAgent, ErrorCode == 0), Application = take_any(Application), ApplicationId = take_any(ApplicationId),
+            ResourceDisplayName = take_anyif(ResourceDisplayName, ErrorCode == 0), ResourceId = take_anyif(ResourceId, ErrorCode == 0),
+            EndpointCall = take_anyif(EndpointCall, ErrorCode == 0), AuthenticationRequirement = take_anyif(AuthenticationRequirement, ErrorCode == 0)
+            by AccountUpn, AccountObjectId, SessionId
+| where set_has_element(Codes, 0) and set_has_element(Codes, 50199)
+| where Timestamp between (FirstPrompt .. (FirstPrompt + 15m))
+| extend UserKey = tolower(AccountUpn)
+| join kind=leftouter LureClicks on $left.UserKey == $right.ClickUser
+| extend LureClicked = isnotnull(ClickTime) and ClickTime between ((Timestamp - 10m) .. Timestamp)
+| extend LureRank = toint(LureClicked)
+| summarize arg_max(LureRank, *) by SessionId                         // one row per session, a matching click preferred
+| extend AbusedClient = ApplicationId in (AbusedClients), ToDrs = ResourceId == DrsResource
+| project Timestamp, ReportId, AccountUpn, AccountObjectId, Application, ApplicationId, AbusedClient, ResourceDisplayName, ToDrs, IPAddress, Country,
+          UserAgent, AuthenticationRequirement, LureClicked, ClickUrl, EndpointCall, SessionId

@@ -1,0 +1,43 @@
+//DC-09 Inbox rule, forwarding or delegate change after a device code sign-in
+//
+// Logic:           Within `follow` of a device code sign-in, the same user created or changed an inbox rule, set mailbox
+//                  forwarding, or granted mailbox or folder permissions. Read from OfficeActivity and CloudAppEvents;
+//                  rows are de-duplicated per user, operation and minute where both connectors are on.
+//                  Flags rules that forward, redirect, delete or move mail.
+// Tuning:          follow. MailOps. Add finance and security keywords to RuleWords if you want only BEC-shaped rules.
+// False positives: A user tidying their inbox on the day of a legitimate device code sign-in. Rules that forward
+//                  externally, delete, or move to RSS/Archive/Conversation History are the BEC shape.
+// Data:            SigninLogs (Microsoft Entra ID); OfficeActivity (Microsoft 365 connector, Exchange) and/or CloudAppEvents
+//                  (Microsoft Defender XDR connector, Defender for Cloud Apps with the Microsoft 365 app connector).
+// Lookback:        Rule runs every 1h over 2d. Mailbox changes are read for the last hour only.
+// Playbook:        docs/devicecode-playbook.md#57-mailbox-rules
+// ATT&CK:          T1114.003, T1564.008
+//
+let alert_window = 1h;
+let follow = 1d;
+let MailOps = dynamic(["New-InboxRule", "Set-InboxRule", "Enable-InboxRule", "UpdateInboxRules", "Set-Mailbox", "Add-MailboxPermission", "Add-RecipientPermission", "Set-MailboxFolderPermission", "Add-MailboxFolderPermission", "New-TransportRule", "Set-TransportRule"]);
+let RuleWords = dynamic(["ForwardTo", "ForwardAsAttachmentTo", "RedirectTo", "ForwardingSmtpAddress", "ForwardingAddress", "DeleteMessage", "MoveToFolder", "MarkAsRead"]);
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | project CodeTime = TimeGenerated, UserKey = tolower(UserPrincipalName), UserPrincipalName, UserId, CodeIP = IPAddress, CodeApp = AppDisplayName, SessionId;
+let MailChanges = union isfuzzy=true
+        (OfficeActivity
+            | where TimeGenerated > ago(alert_window)
+            | where Operation in~ (MailOps)
+            | project ChangeTime = TimeGenerated, Actor = tolower(UserId), Operation, ChangeIP = ClientIP, Params = tostring(Parameters), Mailbox = tostring(OfficeObjectId), Source = "OfficeActivity"),
+        (CloudAppEvents
+            | where TimeGenerated > ago(alert_window)
+            | where ActionType in~ (MailOps)
+            | project ChangeTime = TimeGenerated, Actor = tolower(tostring(RawEventData.UserId)), Operation = ActionType, ChangeIP = IPAddress, Params = tostring(RawEventData.Parameters), Mailbox = tostring(RawEventData.ObjectId), Source = "CloudAppEvents")
+    | where isnotempty(Actor)
+    | summarize arg_min(ChangeTime, *) by Actor, Operation, Minute = bin(ChangeTime, 1m);
+MailChanges
+| join kind=inner CodeEntries on $left.Actor == $right.UserKey
+| where ChangeTime between (CodeTime .. (CodeTime + follow))
+| summarize arg_max(CodeTime, *) by Actor, Operation, ChangeTime
+| extend RuleAction = strcat_array(extract_all(@"(ForwardTo|ForwardAsAttachmentTo|RedirectTo|ForwardingSmtpAddress|ForwardingAddress|DeleteMessage|MoveToFolder|MarkAsRead)", Params), ", "),
+         HidesOrForwards = Params has_any (RuleWords),
+         MinutesAfterCode = datetime_diff("minute", ChangeTime, CodeTime)
+| project TimeGenerated = ChangeTime, UserPrincipalName, UserId, Operation, RuleAction, HidesOrForwards, Mailbox, ChangeIP, Source, Params,
+          CodeTime, CodeIP, CodeApp, MinutesAfterCode, SessionId

@@ -1,0 +1,43 @@
+//DC-12 Device code lure delivered or clicked — Defender XDR Advanced Hunting variant
+//
+// Logic:           Same legs as the Sentinel rule on the native tables: device code URLs in mail (links and QR codes),
+//                  Teams messages and Safe Links clicks. SignInWithin7m adds Microsoft's correlation: a successful sign-in
+//                  by the clicker between 2 minutes before and 7 minutes after the click.
+// Tuning:          ExcludedSenders.
+// False positives: IT instructions for Teams Rooms or TV sign-in.
+// Data:            EmailEvents, EmailUrlInfo, UrlClickEvents (Defender for Office 365 P2); MessageEvents, MessageUrlInfo
+//                  (Teams protection); EntraIdSignInEvents (Entra ID P2) for the sign-in correlation.
+// Lookback:        1d. For a custom detection rule, run every hour and keep Timestamp and ReportId in the output.
+// Playbook:        docs/devicecode-playbook.md#59-lure-delivery
+// ATT&CK:          T1566.002, T1566.003, T1534
+//
+let lookback = 1d;
+let LureTerms = dynamic(["devicelogin", "deviceauth"]);
+let ExcludedSenders = dynamic([]);
+let SignIns = EntraIdSignInEvents
+    | where Timestamp > ago(lookback)
+    | where ErrorCode == 0
+    | project SignInTime = Timestamp, SignInUser = tolower(AccountUpn), SignInIP = IPAddress, SignInApp = Application;
+let Lures = union isfuzzy=true
+    (EmailUrlInfo
+        | where Timestamp > ago(lookback)
+        | where Url has_any (LureTerms)
+        | join kind=inner (EmailEvents | where Timestamp > ago(lookback) | project NetworkMessageId, Recipient = RecipientEmailAddress, Sender = SenderFromAddress, Subject, EmailDirection, DeliveryLocation) on NetworkMessageId
+        | project Timestamp, ReportId, Kind = case(EmailDirection =~ "Intra-org", "Internal mail", UrlLocation =~ "QRCode", "Mail QR code", "Mail link"), Recipient, Sender, Subject, Url, DeliveryLocation),
+    (MessageUrlInfo
+        | where Timestamp > ago(lookback)
+        | where Url has_any (LureTerms)
+        | join kind=inner (MessageEvents | where Timestamp > ago(lookback) | mv-expand Rcpt = RecipientDetails | project TeamsMessageId, Recipient = tostring(Rcpt.RecipientSmtpAddress), Sender = SenderEmailAddress, Subject = MessageSubject, DeliveryLocation) on TeamsMessageId
+        | project Timestamp, ReportId, Kind = "Teams message", Recipient, Sender, Subject, Url, DeliveryLocation),
+    (UrlClickEvents
+        | where Timestamp > ago(lookback)
+        | where Url has_any (LureTerms) or UrlChain has_any (LureTerms)
+        | project Timestamp, ReportId, Kind = strcat("Click (", ActionType, ")"), Recipient = AccountUpn, Url);
+Lures
+| where Sender !in~ (ExcludedSenders)
+| extend UserKey = tolower(Recipient)
+| join kind=leftouter SignIns on $left.UserKey == $right.SignInUser
+| extend Near = Kind startswith "Click" and isnotnull(SignInTime) and (SignInTime - Timestamp) between (-2min .. 7min)
+| summarize SignInWithin7m = max(toint(Near)), SignInIPs = make_set_if(SignInIP, Near, 5), SignInApps = make_set_if(SignInApp, Near, 5)
+            by Timestamp, ReportId, Kind, Recipient, Sender, Subject, Url, DeliveryLocation
+| project Timestamp, ReportId, Kind, Recipient, Sender, Subject, Url, DeliveryLocation, SignInWithin7m, SignInIPs, SignInApps

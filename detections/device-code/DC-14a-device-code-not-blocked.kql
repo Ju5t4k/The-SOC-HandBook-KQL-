@@ -1,0 +1,35 @@
+//DC-14a Device code sign-in that Conditional Access did not block
+//
+// Logic:           Successful device code sign-ins in the last day, per user and app, with what Conditional Access did.
+//                  BlockPolicyNotApplied lists policies with a Block grant that did not apply (usually an exclusion of the
+//                  user, the app or the Device Registration Service). ReportOnlyBlock lists block policies still in
+//                  report-only. NoBlockPolicy means no blocking policy was evaluated at all.
+// Tuning:          AllowedUsers: approved device code users (Teams Rooms resource accounts). Run daily.
+// False positives: Approved exceptions. Anything outside them is a policy gap to close, not an attack by itself.
+// Data:            SigninLogs (Microsoft Entra ID connector; Entra ID P1 for Conditional Access).
+//                  VERIFY: enforcedGrantControls is listed for notApplied policies in your sign-in records.
+// Lookback:        Rule runs every 1d over 1d. Low volume.
+// Playbook:        docs/devicecode-playbook.md#511-conditional-access-gap
+// ATT&CK:          T1078.004, T1528
+//
+let lookback = 1d;
+let AllowedUsers = dynamic([]);           // or: toscalar(_GetWatchlist('DeviceCodeAllowedUsers') | summarize make_list(SearchKey))
+SigninLogs
+| where TimeGenerated > ago(lookback)
+| where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+| where UserPrincipalName !in~ (AllowedUsers)
+// mv-expand drops rows with an empty array, so a sign-in with no policies keeps one empty entry.
+| extend Policies = iff(array_length(ConditionalAccessPolicies) > 0, ConditionalAccessPolicies, dynamic([{}]))
+| mv-expand P = Policies
+| extend PolicyName = tostring(P.displayName), PolicyResult = tostring(P.result), PolicyBlocks = tostring(P.enforcedGrantControls) has "Block"
+| summarize FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), SignIns = dcount(CorrelationId), IPs = make_set(IPAddress, 10),
+            BlockPolicyNotApplied = make_set_if(PolicyName, PolicyBlocks and PolicyResult == "notApplied", 10),
+            ReportOnlyBlock = make_set_if(PolicyName, PolicyBlocks and PolicyResult startswith "reportOnly", 10),
+            AppliedPolicies = make_set_if(PolicyName, PolicyResult == "success", 10)
+            by UserPrincipalName, UserId, AppDisplayName, AppId, ResourceDisplayName
+| extend Gap = case(array_length(BlockPolicyNotApplied) > 0, "Block policy exists but did not apply (exclusion)",
+                    array_length(ReportOnlyBlock) > 0, "Block policy is report-only",
+                    "NoBlockPolicy"),
+         SampleIP = tostring(IPs[0])
+| project TimeGenerated = LastSeen, UserPrincipalName, UserId, AppDisplayName, AppId, ResourceDisplayName, Gap, BlockPolicyNotApplied, ReportOnlyBlock,
+          AppliedPolicies, SignIns, IPs, SampleIP, FirstSeen

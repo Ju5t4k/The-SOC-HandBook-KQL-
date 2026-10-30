@@ -1,0 +1,44 @@
+//DC-11 Mass file download or mail access after a device code sign-in
+//
+// Logic:           SharePoint/OneDrive downloads and Exchange mail access in the last hour by users with a device code
+//                  sign-in in the last day, per user and IP. Alerts when either crosses its threshold. NewIP marks access
+//                  from an address that was neither the code entry's nor seen for the user's device code sessions.
+// Tuning:          FileThreshold, MailThreshold. MailItemsAccessed needs Audit (Standard) and is logged per access
+//                  bundle, so its counts are lower than item counts. // VERIFY counts against your tenant before enabling
+// False positives: OneDrive sync of a new laptop (FileSyncDownloadedFull), eDiscovery or migration accounts.
+// Data:            SigninLogs (Microsoft Entra ID); OfficeActivity (Microsoft 365 connector, SharePoint and Exchange)
+//                  and/or CloudAppEvents (Microsoft Defender XDR connector).
+// Lookback:        Rule runs every 1h over 2d. File and mail events are read for the last hour only.
+// Playbook:        docs/devicecode-playbook.md#58-graph-files-and-mail
+// ATT&CK:          T1530, T1213.002, T1114.002
+//
+let alert_window = 1h;
+let follow = 1d;
+let FileThreshold = 100;                  // downloads per user and IP in an hour
+let MailThreshold = 200;                  // MailItemsAccessed records per user and IP in an hour
+let FileOps = dynamic(["FileDownloaded", "FileSyncDownloadedFull", "FileSyncDownloadedPartial"]);
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | summarize CodeTime = max(TimeGenerated), CodeIPs = make_set(IPAddress, 10) by UserKey = tolower(UserPrincipalName), UserPrincipalName, UserId;
+let Users = CodeEntries | distinct UserKey;
+union isfuzzy=true
+    (OfficeActivity
+        | where TimeGenerated > ago(alert_window)
+        | where tolower(UserId) in (Users)
+        | where Operation in (FileOps) or Operation == "MailItemsAccessed"
+        | project TimeGenerated, UserKey = tolower(UserId), Operation, AccessIP = coalesce(ClientIP, Client_IPAddress), Item = coalesce(OfficeObjectId, SourceFileName), Source = "OfficeActivity"),
+    (CloudAppEvents
+        | where TimeGenerated > ago(alert_window)
+        | where ActionType in (FileOps) or ActionType == "MailItemsAccessed"
+        | extend UserKey = tolower(tostring(RawEventData.UserId))
+        | where UserKey in (Users)
+        | project TimeGenerated, UserKey, Operation = ActionType, AccessIP = IPAddress, Item = ObjectName, Source = "CloudAppEvents")
+| summarize FirstAccess = min(TimeGenerated), Downloads = countif(Operation in (FileOps)), MailAccess = countif(Operation == "MailItemsAccessed"),
+            SampleItems = make_set(Item, 15), Sources = make_set(Source, 2)
+            by UserKey, AccessIP
+| where Downloads >= FileThreshold or MailAccess >= MailThreshold
+| join kind=inner CodeEntries on UserKey
+| extend NewIP = not(set_has_element(CodeIPs, AccessIP)),
+         Behaviour = strcat_array(set_difference(pack_array(iff(Downloads >= FileThreshold, "mass download", ""), iff(MailAccess >= MailThreshold, "mass mail access", "")), dynamic([""])), ", ")
+| project TimeGenerated = FirstAccess, UserPrincipalName, UserId, AccessIP, Behaviour, Downloads, MailAccess, NewIP, SampleItems, Sources, CodeTime, CodeIPs

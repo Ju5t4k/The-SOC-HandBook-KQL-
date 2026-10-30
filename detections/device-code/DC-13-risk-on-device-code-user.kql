@@ -1,0 +1,36 @@
+//DC-13 Identity Protection risk on a device code user
+//
+// Logic:           Risk detections raised in the last hour for users who completed a device code sign-in in the last day,
+//                  with the user's current risk state. SameIP marks a detection on an address the code was entered from;
+//                  a detection on any other address usually points at the attacker's token use.
+// Tuning:          follow. MinRiskLevel: drop to "low" for privileged users.
+// False positives: Low-level detections from travel or new devices. Offline detections can arrive hours after the event;
+//                  RiskTime is when the risky activity happened, TimeGenerated when it was logged.
+// Data:            SigninLogs, AADUserRiskEvents, AADRiskyUsers (Microsoft Entra ID connector; risk tables need Entra ID P2).
+// Lookback:        Rule runs every 1h over 2d. Low volume.
+// Playbook:        docs/devicecode-playbook.md#510-risk-detections
+// ATT&CK:          T1078.004
+//
+let alert_window = 1h;
+let follow = 1d;
+let MinRiskLevel = dynamic(["medium", "high"]);   // add "low" for privileged users
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | summarize CodeTime = max(TimeGenerated), CodeIPs = make_set(IPAddress, 10) by UserId, UserPrincipalName;
+let Users = CodeEntries | distinct UserId;
+let UserRisk = AADRiskyUsers
+    | where TimeGenerated > ago(alert_window + follow)
+    | summarize arg_max(TimeGenerated, RiskLevel, RiskState, RiskDetail) by RiskyUserId = Id
+    | project RiskyUserId, UserRiskLevel = RiskLevel, UserRiskState = RiskState, UserRiskDetail = RiskDetail;
+AADUserRiskEvents
+| where TimeGenerated > ago(alert_window)
+| where UserId in (Users)
+| where RiskLevel in~ (MinRiskLevel)
+| project TimeGenerated, RiskTime = ActivityDateTime, UserId, RiskEventType, RiskLevel, RiskState, RiskDetail, RiskIP = IpAddress,
+          RiskCountry = tostring(Location.countryOrRegion), DetectionTimingType, Source, RiskCorrelationId = CorrelationId
+| join kind=inner CodeEntries on UserId
+| join kind=leftouter UserRisk on $left.UserId == $right.RiskyUserId
+| extend SameIP = set_has_element(CodeIPs, RiskIP)
+| project TimeGenerated, RiskTime, UserPrincipalName, UserId, RiskEventType, RiskLevel, RiskState, RiskDetail, RiskIP, RiskCountry, SameIP,
+          DetectionTimingType, Source, UserRiskLevel, UserRiskState, CodeTime, CodeIPs, RiskCorrelationId

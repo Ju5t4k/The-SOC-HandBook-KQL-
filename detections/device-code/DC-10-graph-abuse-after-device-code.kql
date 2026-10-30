@@ -1,0 +1,46 @@
+//DC-10 Graph API abuse after a device code sign-in
+//
+// Logic:           Microsoft Graph calls in the last hour by users with a device code sign-in in the last day, summarised
+//                  per user, IP and session. Alerts on bulk directory enumeration, mailbox or file reads, any search call,
+//                  or a scripting user agent. SameSession = true ties the calls to the device code session itself.
+// Tuning:          EnumThreshold, MailThreshold, FileThreshold. ToolAgents. Exclude your own automation's AppId if a
+//                  service account uses device code.
+// False positives: Outlook and OneDrive clients make many Graph calls with normal user agents; they rarely trip
+//                  enumeration or search thresholds. Admins running Graph PowerShell after a device code login will.
+// Data:            SigninLogs (Microsoft Entra ID). MicrosoftGraphActivityLogs: Entra diagnostic setting
+//                  "MicrosoftGraphActivityLogs" to the workspace. Not on by default; nothing before it was enabled.
+// Lookback:        Rule runs every 1h over 2d. Graph activity is high volume: the user filter runs first.
+// Playbook:        docs/devicecode-playbook.md#58-graph-files-and-mail
+// ATT&CK:          T1087.004, T1069.003, T1526, T1114.002
+//
+let alert_window = 1h;
+let follow = 1d;
+let EnumThreshold = 50;                   // directory reads (users, groups, apps, roles) in an hour
+let MailThreshold = 100;                  // mailbox reads in an hour
+let FileThreshold = 100;                  // drive and site reads in an hour
+let ToolAgents = @"(?i)(python|aiohttp|requests/|axios|node-fetch|undici|go-http-client|curl/|wget|powershell|okhttp|java/|libwww)";
+let CodeEntries = SigninLogs
+    | where TimeGenerated > ago(alert_window + follow)
+    | where AuthenticationProtocol =~ "deviceCode" and ResultType == "0"
+    | summarize CodeTime = max(TimeGenerated), CodeSessions = make_set(SessionId, 20), CodeIPs = make_set(IPAddress, 10) by UserId, UserPrincipalName;
+let Users = CodeEntries | distinct UserId;
+MicrosoftGraphActivityLogs
+| where TimeGenerated > ago(alert_window)
+| where UserId in (Users)
+| extend Path = tolower(tostring(parse_url(RequestUri).Path))
+| extend Kind = case(Path matches regex @"/(users|groups|directoryobjects|applications|serviceprincipals|rolemanagement|directoryroles|devices|organization)(/|$|\?)", "Directory",
+                     Path has_any ("messages", "mailfolders", "mailboxsettings"), "Mail",
+                     Path has_any ("drives", "driveitems", "sites"), "Files",
+                     "Other"),
+         IsSearch = RequestUri has "$search" or Path has "/search/query"
+| summarize FirstCall = min(TimeGenerated), Calls = count(), DirectoryReads = countif(Kind == "Directory"), MailReads = countif(Kind == "Mail"),
+            FileReads = countif(Kind == "Files"), Searches = countif(IsSearch), Failed = countif(ResponseStatusCode >= 400),
+            Agents = make_set(UserAgent, 5), Apps = make_set(AppId, 5), SamplePaths = make_set(Path, 15)
+            by UserId, IPAddress, SessionId
+| join kind=inner CodeEntries on UserId
+| extend ToolAgent = strcat_array(Agents, " ") matches regex ToolAgents,
+         SameSession = set_has_element(CodeSessions, SessionId)
+| where DirectoryReads >= EnumThreshold or MailReads >= MailThreshold or FileReads >= FileThreshold or Searches > 0 or ToolAgent
+| extend Behaviour = strcat_array(set_difference(pack_array(iff(DirectoryReads >= EnumThreshold, "directory enumeration", ""), iff(MailReads >= MailThreshold, "bulk mail reads", ""), iff(FileReads >= FileThreshold, "bulk file reads", ""), iff(Searches > 0, "search", ""), iff(ToolAgent, "tool user agent", "")), dynamic([""])), ", ")
+| project TimeGenerated = FirstCall, UserPrincipalName, UserId, IPAddress, Behaviour, Calls, DirectoryReads, MailReads, FileReads, Searches, Failed,
+          Agents, Apps, SamplePaths, SameSession, CodeTime, CodeIPs, SessionId
