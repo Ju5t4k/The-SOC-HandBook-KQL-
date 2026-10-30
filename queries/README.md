@@ -12,7 +12,7 @@
 | [`clickfix-persistence.kql`](clickfix-persistence.kql) | `Device*` | What was left behind — run keys, Winlogon, IFEO, tasks, services, startup folder, LOLBin drops, COM and shell hijacks, forced browser extensions. The reimage decision |
 | [`clickfix-scope.kql`](clickfix-scope.kql) | `Device*`, `EmailUrlInfo`, `UrlClickEvents` | Blast radius. Give it a URL, hash, command or IP and it finds every other device and user hit the same way — and everyone who was sent the lure but has not clicked yet |
 | [`devicecode.kql`](devicecode.kql) | `SigninLogs`, non-interactive, `AuditLogs`, mail and Teams URL tables | Device code phishing triage. Scores `deviceCode` sign-ins (13 indicators): token reuse from another ASN in the same session, the Authentication Broker reaching device registration, a device registered after, a device code link received before, an app consented or owned by neither Microsoft nor you |
-| [`devicecode-timeline.kql`](devicecode-timeline.kql) | `SigninLogs`, non-interactive, service principal, `AuditLogs`, `OfficeActivity`, `Email*`, `Message*`, `UrlClickEvents`, `DeviceEvents`, `MicrosoftGraphActivityLogs` | The device code incident as one timeline, from the set-up (earlier code attempts, app changes, lures) through code entry and token use to devices, Graph calls, mail reads and internal phishing |
+| [`devicecode-timeline.kql`](devicecode-timeline.kql) | `SigninLogs`, non-interactive, service principal, `AuditLogs`, `OfficeActivity`, `Email*`, `Message*`, `UrlClickEvents`, `DeviceEvents`, `MicrosoftGraphActivityLogs`, `AADUserRiskEvents` | DC-16. The device code incident as one timeline, from the set-up (earlier code attempts, app changes, lures) through code entry and token use to devices, Graph calls, mail reads, risk detections and internal phishing. Pivot on a user, an IP or both |
 | [`devicecode-persistence.kql`](devicecode-persistence.kql) | `AuditLogs`, `OfficeActivity`, service principal | What survives a password reset, split before and after the pivot — MFA methods, groups, CA changes, apps and secrets, devices, mailbox rules, and what each granted app then did |
 | [`devicecode-scope.kql`](devicecode-scope.kql) | `SigninLogs`, non-interactive, `AuditLogs`, `MicrosoftGraphActivityLogs`, mail and Teams URL tables | Blast radius by IP, ASN, app, user agent or lure sender — and everyone sent a device code link. ASN is the one that finds the campaign |
 | [`bec.kql`](bec.kql) | `OfficeActivity` | BEC triage. Scores mailbox rules, forwarding and delegation for the hide-and-redirect pattern (7 indicators), against peak daily outbound and whether the actor signed in from that address |
@@ -48,7 +48,8 @@ the steps, containment order and ticket checklist:
 - [`../docs/clickfix-playbook.md`](../docs/clickfix-playbook.md) — endpoint
   side, fake-CAPTCHA paste-and-run execution
 - [`../docs/devicecode-playbook.md`](../docs/devicecode-playbook.md) — identity
-  side, OAuth device code phishing
+  side, OAuth device code phishing. The scheduled rules that raise these
+  alerts are in [`../detections/device-code/`](../detections/device-code/README.md)
 - [`../docs/bec-playbook.md`](../docs/bec-playbook.md) — mailbox side, business
   email compromise and invoice fraud
 - [`../docs/attachment-playbook.md`](../docs/attachment-playbook.md) — mail and

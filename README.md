@@ -8,17 +8,25 @@ KQL queries for SOC analysts working in Microsoft Sentinel and Defender XDR.
 ## Layout
 
 ```
-queries/    the queries — see queries/README.md for the index
-docs/       playbooks and reference
+queries/      investigation queries — see queries/README.md for the index
+detections/   scheduled Sentinel rules and hunting queries, with Defender XDR
+              variants — see detections/README.md
+docs/         playbooks and reference
+tools/        the checks CI runs: KQL lint and detection rule checks
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed recently.
 
 ### Playbooks
 
 - [ClickFix](docs/clickfix-playbook.md) — fake-CAPTCHA paste-and-run. Eight
   steps from the paste to the reimage decision.
 - [Device code phishing](docs/devicecode-playbook.md) — OAuth device code
-  token theft, the device-and-PRT variant, and the attacker's own app. Seven
-  steps, from the lure and set-up before the code to what the token did after.
+  token theft, the device-and-PRT variant, and the attacker's own app. A
+  15-minute triage, thirteen investigation steps and ordered containment,
+  backed by sixteen [detections](detections/device-code/README.md), a
+  [TTP reference](docs/devicecode-ttps.md) and a
+  [coverage matrix](docs/devicecode-coverage.md).
 - [Business email compromise](docs/bec-playbook.md) — mailbox takeover and
   invoice fraud. Seven steps; check tenant-wide transport rules.
 - [Malicious attachment](docs/attachment-playbook.md) — the `SHA256` join from
@@ -42,6 +50,15 @@ it. Nothing here needs installing.
 Queries are written for **Sentinel** unless the query says otherwise. On
 **Defender XDR Advanced Hunting** the time column on `Device*` tables is
 `Timestamp` rather than `TimeGenerated`, and lookback is capped at 30 days.
+
+## Checks
+
+CI runs these on every push. Run them before you commit:
+
+```
+python3 tools/lint_kql.py queries detections
+python3 tools/check_rules.py          # needs pyyaml
+```
 
 ## Licence
 
