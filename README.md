@@ -17,7 +17,8 @@ docs/       playbooks and reference
 - [ClickFix](docs/clickfix-playbook.md) — fake-CAPTCHA paste-and-run. Eight
   steps from the paste to the reimage decision.
 - [Device code phishing](docs/devicecode-playbook.md) — OAuth device code
-  token theft. Six steps; revoking sessions matters more than the password.
+  token theft, the device-and-PRT variant, and the attacker's own app. Seven
+  steps, from the lure and set-up before the code to what the token did after.
 - [Business email compromise](docs/bec-playbook.md) — mailbox takeover and
   invoice fraud. Seven steps; check tenant-wide transport rules.
 - [Malicious attachment](docs/attachment-playbook.md) — the `SHA256` join from

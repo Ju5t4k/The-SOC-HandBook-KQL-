@@ -1,28 +1,33 @@
 //DeviceCode persistence query
 //
-// What keeps the attacker in after the token is revoked and the password reset.
-let TimeToCheck = 14d;
+// What keeps the attacker in after the token is revoked and the password reset, and what was set up before the code. Set PivotTime to EventTime from devicecode.kql.
+let PivotTime = now();
+let LookBefore = 14d;                     // set-up before the pivot: apps, secrets, MFA methods, groups
 let UserIdentityCheck = "";
 //
-// Directory changes that extend access or bypass MFA.
-let PersistOps = dynamic(["User registered security info","User changed default security info","Admin registered security info","User deleted security info","Add member to role","Add eligible member to role","Consent to application","Add delegated permission grant","Add app role assignment to service principal","Add service principal","Add service principal credentials","Add application","Update application","Add owner to application","Add owner to service principal","Update conditional access policy","Delete conditional access policy","Disable Strong Authentication","Reset user password"]);
+let StartTime = PivotTime - LookBefore;
+// Directory changes that extend access, bypass MFA or Conditional Access, or give an app a way in.
+let PersistOps = dynamic(["User registered security info","User changed default security info","Admin registered security info","User deleted security info","Add member to role","Add eligible member to role","Add member to group","Consent to application","Add delegated permission grant","Add app role assignment to service principal","Add app role assignment grant to user","Add service principal","Add service principal credentials","Add application","Update application","Certificates and secrets management","Add owner to application","Add owner to service principal","Update service principal","Update conditional access policy","Delete conditional access policy","Add named location","Update named location","Update authorization policy","Set domain authentication","Set federation settings on domain","Disable Strong Authentication","Reset user password"]);
 // Devices and passwordless credentials. Each holds a credential that survives session revocation.
 let DeviceOps = dynamic(["Add device","Register device","Add registered owner to device","Add registered users to device","Add Windows Hello for Business credential","Add passwordless phone sign-in credential","Add Passkey (device-bound)","Add platform credential"]);
 let MailOps = dynamic(["New-InboxRule","Set-InboxRule","Enable-InboxRule","UpdateInboxRules","Set-Mailbox","Add-MailboxPermission","Add-RecipientPermission","Set-MailboxFolderPermission","Add-MailboxFolderPermission","New-TransportRule","Set-TransportRule"]);
-// Applications this user consented to, so their own sign-ins can be tied back to the user.
-let Consents = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any ("Consent to application","Add delegated permission grant","Add app role assignment to service principal") | extend Consenter = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)) | mv-expand TargetResources | where tostring(TargetResources.type) =~ "ServicePrincipal" | summarize ConsentTime = min(TimeGenerated) by SpId = tostring(TargetResources.id), Consenter;
+// Service principals this user created, consented to, gave a secret or took ownership of. Their sign-ins are tied back to the user.
+let AppGrants = AuditLogs | where TimeGenerated >= StartTime | where OperationName has_any ("Consent to application","Add delegated permission grant","Add app role assignment to service principal","Add service principal","Add service principal credentials","Add owner to service principal") | extend Granter = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)) | mv-expand TargetResources | where tostring(TargetResources.type) =~ "ServicePrincipal" | summarize GrantTime = min(TimeGenerated), GrantOps = make_set(OperationName, 5) by SpId = tostring(TargetResources.id), Granter;
 //
 union isfuzzy=true
-    (AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (PersistOps) | mv-expand TargetResources | extend Method = "Directory", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), ActorIP = tostring(InitiatedBy.user.ipAddress), Target = coalesce(tostring(TargetResources.userPrincipalName), tostring(TargetResources.displayName)), What = OperationName, Outcome = Result, Evidence = tostring(TargetResources.modifiedProperties)),
-    (AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (DeviceOps) | mv-expand TargetResources | extend Method = "Device", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), ActorIP = tostring(InitiatedBy.user.ipAddress), Target = coalesce(tostring(TargetResources.displayName), tostring(TargetResources.userPrincipalName)), What = OperationName, Outcome = Result, Evidence = strcat(LoggedByService, " | ", tostring(TargetResources.modifiedProperties))),
-    (OfficeActivity | where TimeGenerated >= ago(TimeToCheck) | where Operation in~ (MailOps) | extend Method = "Mailbox", Actor = UserId, ActorIP = ClientIP, Target = MailboxOwnerUPN, What = Operation, Outcome = ResultStatus, Evidence = Parameters),
-    // Sign-ins by applications after this user consented to them. Actor is the consenting user.
-    (AADServicePrincipalSignInLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | join kind=inner Consents on $left.ServicePrincipalId == $right.SpId | where TimeGenerated >= ConsentTime | summarize TimeGenerated = min(TimeGenerated), SignIns = count(), IPs = make_set(IPAddress, 10), Resources = make_set(ResourceDisplayName, 10) by ServicePrincipalName, AppId, Consenter, Day = bin(TimeGenerated, 1d) | extend Method = "Service principal", Actor = Consenter, ActorIP = strcat_array(IPs, ", "), Target = ServicePrincipalName, What = "Application sign-in after consent", Outcome = strcat(SignIns, " sign-ins"), Evidence = strcat(AppId, " -> ", strcat_array(Resources, ", ")))
+    (AuditLogs | where TimeGenerated >= StartTime | where OperationName has_any (PersistOps) | mv-expand TargetResources | extend Method = iff(OperationName has_any ("application","service principal","Consent","permission grant","app role"), "App", "Directory"), Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), ActorIP = tostring(InitiatedBy.user.ipAddress), Target = coalesce(tostring(TargetResources.userPrincipalName), tostring(TargetResources.displayName)), What = OperationName, Outcome = Result, Evidence = tostring(TargetResources.modifiedProperties)),
+    (AuditLogs | where TimeGenerated >= StartTime | where OperationName has_any (DeviceOps) | mv-expand TargetResources | extend Method = "Device", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), ActorIP = tostring(InitiatedBy.user.ipAddress), Target = coalesce(tostring(TargetResources.userPrincipalName), tostring(TargetResources.displayName)), What = OperationName, Outcome = Result, Evidence = strcat(LoggedByService, " | ", tostring(TargetResources.modifiedProperties))),
+    (OfficeActivity | where TimeGenerated >= StartTime | where Operation in~ (MailOps) | extend Method = "Mailbox", Actor = UserId, ActorIP = ClientIP, Target = MailboxOwnerUPN, What = Operation, Outcome = ResultStatus, Evidence = Parameters),
+    // Sign-ins by those service principals after the grant. Actor is the user who granted.
+    (AADServicePrincipalSignInLogs | where TimeGenerated >= StartTime | where ResultType == "0" | join kind=inner AppGrants on $left.ServicePrincipalId == $right.SpId | where TimeGenerated >= GrantTime | summarize First = min(TimeGenerated), SignIns = count(), IPs = make_set(IPAddress, 10), Resources = make_set(ResourceDisplayName, 10), GrantOps = take_any(GrantOps) by ServicePrincipalName, AppId, Granter, Day = bin(TimeGenerated, 1d) | extend TimeGenerated = First, Method = "Service principal", Actor = Granter, ActorIP = strcat_array(IPs, ", "), Target = ServicePrincipalName, What = strcat("App sign-in after ", strcat_array(GrantOps, " / ")), Outcome = strcat(SignIns, " sign-ins"), Evidence = strcat(AppId, " -> ", strcat_array(Resources, ", ")))
 | where Actor contains UserIdentityCheck or Target contains UserIdentityCheck
+| extend Window = iff(TimeGenerated < PivotTime, "1-Before pivot", "2-After pivot")
 | project-rename EventTime = TimeGenerated
-| project EventTime, Method, What, Outcome, Actor, ActorIP, Target, Evidence
+| project EventTime, Window, Method, What, Outcome, Actor, ActorIP, Target, Evidence
 | sort by EventTime desc
 //
-//| where Method in ("Device","Service principal")    // the two that survive session revocation
-//| where What has_any ("security info","Consent")     // MFA methods and app consent
-//| summarize Changes = count(), Kinds = make_set(What, 15) by Actor, Method
+//| where Window == "2-After pivot"                     // the attacker's changes
+//| where Window == "1-Before pivot" and Method == "App"  // apps and secrets set up before the phish
+//| where Method in ("Device","Service principal","App")  // the ones that survive session revocation
+//| where What has_any ("security info","Consent")       // MFA methods and app consent
+//| summarize Changes = count(), Kinds = make_set(What, 15) by Actor, Method, Window

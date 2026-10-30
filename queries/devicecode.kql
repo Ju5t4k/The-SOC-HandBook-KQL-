@@ -1,43 +1,74 @@
 //DeviceCode UserPrincipal query
 //
-// Device code sign-ins, scored. TokenMoved and DeviceAdded are the deciding columns.
+// Device code sign-ins, scored. TokenMoved, BrokerToDrs and DeviceAdded decide; LureBefore, AppConsent and FailedDcBefore show the set-up around it.
 let TimeToCheck = 14d;
 let BaselineToCheck = 90d;
+let LureWindow = 24h;                     // a device code link received this long before the sign-in counts
+let ConsentWindow = 24h;                  // an app consent this long after the sign-in counts
 let UserIdentityCheck = "";
 let IPtoCheck = "";
 let AppCheck = "";
 //
+let MicrosoftTenant = "f8cdef31-a31e-4b4a-93e4-5f571e91255a";   // owns Microsoft's first-party apps
+let BrokerApp = "29d9ed98-a469-4536-ade2-f981bc1d605e";          // Microsoft Authentication Broker
+let DrsResource = "01cb2876-7ebd-4aa4-9cc9-d28bd4d359a9";        // Device Registration Service
 // Public clients most often abused for device code phishing. Add any your tenant shows.
 let AbusedApps = dynamic(["29d9ed98-a469-4536-ade2-f981bc1d605e","d3590ed6-52b3-4102-aeff-aad2292ab01c","04b07795-8ddb-461a-bbee-02f9e1bf7b46","1950a258-227b-4e31-a9cf-717495945fc2","aebc6443-996d-45c2-90f0-388ff96faa56","9ba1a5c7-f17a-4de9-a1f1-6178c8d51223","872cd9fa-d31f-45e0-9eab-6e460a02d1f1"]);
 // Registrations a user makes. A registered device gets its own Primary Refresh Token.
 let DeviceOps = dynamic(["Add device","Register device","Add registered owner to device","Add registered users to device","Add Windows Hello for Business credential","Add passwordless phone sign-in credential","Add Passkey (device-bound)","Add platform credential"]);
-let HighValueResources = dynamic(["Microsoft Graph","Office 365 Exchange Online","Office 365 SharePoint Online","Windows Azure Service Management API","Azure Key Vault"]);
+let ConsentOps = dynamic(["Consent to application","Add delegated permission grant","Add app role assignment to service principal"]);
+// Words in a device code lure URL: microsoft.com/devicelogin, aka.ms/devicelogin, .../oauth2/deviceauth.
+let LureTerms = dynamic(["devicelogin","deviceauth"]);
+let HighValueResources = dynamic(["Microsoft Graph","Office 365 Exchange Online","Office 365 SharePoint Online","Windows Azure Service Management API","Azure Key Vault","Device Registration Service"]);
 //
 let Job = IdentityInfo | where AccountUPN contains UserIdentityCheck | where TimeGenerated >= ago(BaselineToCheck) | extend AccountUPN = tolower(AccountUPN) | summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles, "3.Manager", Manager) | project JobDetails, JobUserKey = AccountUPN;
-let UserDcHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | summarize DaysDcSeenByUser = dcount(bin(TimeGenerated, 1d)) by DcUserKey = tolower(UserPrincipalName);
-let OrgDcHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | summarize UsersUsingDcInOrg = dcount(UserPrincipalName), DaysDcSeenInOrg = dcount(bin(TimeGenerated, 1d)) by OdResource = ResourceDisplayName;
+let UserDcHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | summarize DaysDcSeenByUser = dcount(bin(TimeGenerated, 1d)), DcFailTimes = make_list_if(TimeGenerated, ResultType != "0", 100) by DcUserKey = tolower(UserPrincipalName);
+// How many users have ever used device code with this client app.
+let AppDcHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | summarize UsersUsingDcForApp = dcount(UserPrincipalName), DaysDcSeenForApp = dcount(bin(TimeGenerated, 1d)) by AdAppId = AppId;
 let UserIpHistory = SigninLogs | where TimeGenerated >= ago(BaselineToCheck) | where ResultType == "0" | summarize DaysIpSeenByUser = dcount(bin(TimeGenerated, 1d)) by IpUserKey = tolower(UserPrincipalName), IpAddr = IPAddress;
 // Token use in the same session as the device code sign-in. Same SessionId = same stolen token.
 let TokenUse = AADNonInteractiveUserSignInLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | where isnotempty(SessionId) | summarize TokenUseCount = count(), TokenIPs = make_set(IPAddress, 25), TokenASNs = make_set(AutonomousSystemNumber, 15), TokenApps = make_set(AppDisplayName, 10), TokenResources = make_set(ResourceDisplayName, 10), FirstTokenUse = min(TimeGenerated), LastTokenUse = max(TimeGenerated) by TuSessionId = SessionId;
-let DeviceRegs = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (DeviceOps) | mv-expand TargetResources | extend DrUserKey = tolower(coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))) | where isnotempty(DrUserKey) | summarize DevicesAdded = count(), DevicesAddedNames = make_set(tostring(TargetResources.displayName), 10), DeviceOpsUsed = make_set(OperationName, 10), FirstDeviceAdded = min(TimeGenerated), LastDeviceAdded = max(TimeGenerated) by DrUserKey;
+// Device registrations. Entra often logs these as done by the Device Registration Service, so the user comes from the targets.
+let DeviceRegs = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (DeviceOps) | mv-apply T = TargetResources on (summarize TargetUser = take_anyif(tostring(T.userPrincipalName), tostring(T.type) =~ "User"), TargetDevice = take_anyif(tostring(T.displayName), tostring(T.type) =~ "Device")) | extend DrUserKey = tolower(coalesce(tostring(InitiatedBy.user.userPrincipalName), TargetUser)) | where isnotempty(DrUserKey) | summarize DevicesAdded = count(), DevicesAddedNames = make_set_if(TargetDevice, isnotempty(TargetDevice), 10), DeviceOpsUsed = make_set(OperationName, 10), FirstDeviceAdded = min(TimeGenerated), LastDeviceAdded = max(TimeGenerated) by DrUserKey;
+// Lures: device code links sent to the user by mail or Teams, or clicked.
+let Lures = union isfuzzy=true
+    (EmailUrlInfo | where TimeGenerated >= ago(TimeToCheck + LureWindow) | where Url has_any (LureTerms) | join kind=inner (EmailEvents | where TimeGenerated >= ago(TimeToCheck + LureWindow) | where EmailDirection == "Inbound" | project NetworkMessageId, LuUserKey = tolower(RecipientEmailAddress), LureTime = TimeGenerated, Sender = SenderFromAddress) on NetworkMessageId | project LuUserKey, LureTime, Sender, LureSource = "Email"),
+    (MessageUrlInfo | where TimeGenerated >= ago(TimeToCheck + LureWindow) | where Url has_any (LureTerms) | join kind=inner (MessageEvents | where TimeGenerated >= ago(TimeToCheck + LureWindow) | mv-expand Rcpt = RecipientDetails | project TeamsMessageId, LuUserKey = tolower(tostring(Rcpt.RecipientSmtpAddress)), LureTime = TimeGenerated, Sender = SenderEmailAddress) on TeamsMessageId | project LuUserKey, LureTime, Sender, LureSource = "Teams"),
+    (UrlClickEvents | where TimeGenerated >= ago(TimeToCheck + LureWindow) | where Url has_any (LureTerms) | project LuUserKey = tolower(AccountUpn), LureTime = TimeGenerated, Sender = "", LureSource = "Click")
+    | summarize LureTimes = make_list(LureTime, 100), LureSources = make_set(LureSource, 3), LureSenders = make_set_if(Sender, isnotempty(Sender), 10) by LuUserKey;
+// Apps the user consented to. Device code phishing with the attacker's own app ends in a consent.
+let Consents = AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (ConsentOps) | extend CoUserKey = tolower(tostring(InitiatedBy.user.userPrincipalName)) | where isnotempty(CoUserKey) | mv-apply T = TargetResources on (summarize AppName = take_anyif(tostring(T.displayName), tostring(T.type) =~ "ServicePrincipal")) | summarize ConsentTimes = make_list(TimeGenerated, 100), ConsentedApps = make_set_if(AppName, isnotempty(AppName), 10) by CoUserKey;
 //
 SigninLogs
 | where TimeGenerated >= ago(TimeToCheck)
 | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow"
-| extend UserKey = tolower(UserPrincipalName), Country = tostring(LocationDetails.countryOrRegion), City = tostring(LocationDetails.city), DeviceName = tostring(DeviceDetail.displayName), IsCompliant = tostring(DeviceDetail.isCompliant), IsManaged = tostring(DeviceDetail.isManaged)
-| join kind=leftouter Job on $left.UserKey == $right.JobUserKey | join kind=leftouter UserDcHistory on $left.UserKey == $right.DcUserKey | join kind=leftouter OrgDcHistory on $left.ResourceDisplayName == $right.OdResource | join kind=leftouter UserIpHistory on $left.UserKey == $right.IpUserKey, $left.IPAddress == $right.IpAddr | join kind=leftouter TokenUse on $left.SessionId == $right.TuSessionId | join kind=leftouter DeviceRegs on $left.UserKey == $right.DrUserKey
-| extend DaysDcSeenByUser = coalesce(DaysDcSeenByUser, 0), DaysIpSeenByUser = coalesce(DaysIpSeenByUser, 0), UsersUsingDcInOrg = coalesce(UsersUsingDcInOrg, 0), DevicesAdded = coalesce(DevicesAdded, 0)
-| extend OtherASNsAfter = set_difference(coalesce(TokenASNs, dynamic([])), pack_array(AutonomousSystemNumber)), OtherIPsAfter = set_difference(coalesce(TokenIPs, dynamic([])), pack_array(IPAddress))
-| extend Succeeded = ResultType == "0", AbusedApp = AppId in~ (AbusedApps), FirstDcForUser = DaysDcSeenByUser <= 1, NewIpForUser = DaysIpSeenByUser <= 1, Unmanaged = IsManaged !~ "true" and IsCompliant !~ "true", HighValue = ResourceDisplayName in~ (HighValueResources), TokenMoved = array_length(OtherASNsAfter) > 0, DeviceAdded = isnotnull(LastDeviceAdded) and LastDeviceAdded >= TimeGenerated
-// 9 indicators, 15 at most. Weights are in docs/devicecode-playbook.md.
-| extend DeviceCodeScore = toint(Succeeded) * 3 + toint(TokenMoved) * 3 + toint(DeviceAdded) * 2 + toint(FirstDcForUser) * 2 + toint(AbusedApp) + toint(NewIpForUser) + toint(Unmanaged) + toint(HighValue) + toint(UsersUsingDcInOrg <= 3)
 | where UserPrincipalName contains UserIdentityCheck | where IPAddress contains IPtoCheck | where AppDisplayName contains AppCheck
+| extend UserKey = tolower(UserPrincipalName), Country = tostring(LocationDetails.countryOrRegion), City = tostring(LocationDetails.city), DeviceName = tostring(DeviceDetail.displayName), IsCompliant = tostring(DeviceDetail.isCompliant), IsManaged = tostring(DeviceDetail.isManaged)
+| join kind=leftouter Job on $left.UserKey == $right.JobUserKey | join kind=leftouter UserDcHistory on $left.UserKey == $right.DcUserKey | join kind=leftouter AppDcHistory on $left.AppId == $right.AdAppId | join kind=leftouter UserIpHistory on $left.UserKey == $right.IpUserKey, $left.IPAddress == $right.IpAddr | join kind=leftouter TokenUse on $left.SessionId == $right.TuSessionId | join kind=leftouter DeviceRegs on $left.UserKey == $right.DrUserKey | join kind=leftouter Lures on $left.UserKey == $right.LuUserKey | join kind=leftouter Consents on $left.UserKey == $right.CoUserKey
+| extend DaysDcSeenByUser = coalesce(DaysDcSeenByUser, 0), DaysIpSeenByUser = coalesce(DaysIpSeenByUser, 0), UsersUsingDcForApp = coalesce(UsersUsingDcForApp, 0), DevicesAdded = coalesce(DevicesAdded, 0)
+// mv-apply drops rows whose array is empty, so give each list one null entry.
+| extend LureTimes = iff(array_length(LureTimes) > 0, LureTimes, dynamic([null])), ConsentTimes = iff(array_length(ConsentTimes) > 0, ConsentTimes, dynamic([null])), DcFailTimes = iff(array_length(DcFailTimes) > 0, DcFailTimes, dynamic([null]))
+| mv-apply Lt = LureTimes to typeof(datetime) on (summarize LuresBefore = countif(Lt between ((TimeGenerated - LureWindow) .. TimeGenerated)), LastLureBefore = maxif(Lt, Lt between ((TimeGenerated - LureWindow) .. TimeGenerated)))
+| mv-apply Ct = ConsentTimes to typeof(datetime) on (summarize ConsentsNear = countif(Ct between ((TimeGenerated - 1h) .. (TimeGenerated + ConsentWindow))))
+// Failed or abandoned codes in the 24 hours before: the attacker re-sends when a 15-minute code expires.
+| mv-apply Ft = DcFailTimes to typeof(datetime) on (summarize FailedDcBefore = countif(Ft between ((TimeGenerated - 24h) .. (TimeGenerated - 1s))))
+| extend OtherASNsAfter = set_difference(coalesce(TokenASNs, dynamic([])), pack_array(AutonomousSystemNumber)), OtherIPsAfter = set_difference(coalesce(TokenIPs, dynamic([])), pack_array(IPAddress))
+| extend Succeeded = ResultType == "0", AbusedApp = AppId in~ (AbusedApps), FirstDcForUser = DaysDcSeenByUser <= 1, NewIpForUser = DaysIpSeenByUser <= 1, Unmanaged = IsManaged !~ "true" and IsCompliant !~ "true", HighValue = ResourceDisplayName in~ (HighValueResources), RareDcForApp = UsersUsingDcForApp <= 3,
+         TokenMoved = array_length(OtherASNsAfter) > 0, DeviceAdded = isnotnull(LastDeviceAdded) and LastDeviceAdded >= TimeGenerated,
+         // Storm-2372 variant: device code for the Authentication Broker, then a Device Registration Service token, then an attacker device and a PRT.
+         BrokerToDrs = AppId == BrokerApp and (ResourceId == DrsResource or ResourceDisplayName =~ "Device Registration Service" or set_has_element(coalesce(TokenResources, dynamic([])), "Device Registration Service")),
+         // A client app owned by neither Microsoft nor your tenant: the attacker's own app. // VERIFY AppOwnerTenantId is populated in your workspace
+         NonMicrosoftApp = isnotempty(AppOwnerTenantId) and AppOwnerTenantId != MicrosoftTenant and AppOwnerTenantId != AADTenantId,
+         LureBefore = LuresBefore > 0, AppConsent = ConsentsNear > 0
+// 13 indicators, 24 at most. Weights are in docs/devicecode-playbook.md.
+| extend DeviceCodeScore = toint(Succeeded) * 3 + toint(TokenMoved) * 3 + toint(BrokerToDrs) * 3 + toint(DeviceAdded) * 2 + toint(LureBefore) * 2 + toint(AppConsent) * 2 + toint(NonMicrosoftApp) * 2 + toint(FirstDcForUser) * 2 + toint(AbusedApp) + toint(NewIpForUser) + toint(Unmanaged) + toint(HighValue) + toint(RareDcForApp)
 | project-rename LogCreatedTime = TimeGenerated, EventTime = CreatedDateTime
-| project EventTime, LogCreatedTime, DeviceCodeScore, UserPrincipalName, JobDetails, ResultType, ResultDescription, AuthenticationProtocol, OriginalTransferMethod, AppDisplayName, AppId, AbusedApp, ResourceDisplayName, HighValue, IPAddress, AutonomousSystemNumber, Country, City, DaysIpSeenByUser, NewIpForUser, DaysDcSeenByUser, FirstDcForUser, UsersUsingDcInOrg, DeviceName, IsManaged, IsCompliant, Unmanaged, TokenMoved, OtherASNsAfter, OtherIPsAfter, TokenUseCount, TokenApps, TokenResources, FirstTokenUse, LastTokenUse, DeviceAdded, DevicesAddedNames, DeviceOpsUsed, FirstDeviceAdded, LastDeviceAdded, AuthenticationRequirement, ConditionalAccessStatus, RiskLevelDuringSignIn, RiskState, UserAgent, SessionId, UniqueTokenIdentifier, CorrelationId
+| project EventTime, LogCreatedTime, DeviceCodeScore, UserPrincipalName, JobDetails, ResultType, ResultDescription, AuthenticationProtocol, OriginalTransferMethod, AppDisplayName, AppId, AppOwnerTenantId, NonMicrosoftApp, AbusedApp, ResourceDisplayName, HighValue, BrokerToDrs, IPAddress, AutonomousSystemNumber, Country, City, DaysIpSeenByUser, NewIpForUser, DaysDcSeenByUser, FirstDcForUser, FailedDcBefore, UsersUsingDcForApp, RareDcForApp, LureBefore, LastLureBefore, LureSources, LureSenders, AppConsent, ConsentedApps, DeviceName, IsManaged, IsCompliant, Unmanaged, TokenMoved, OtherASNsAfter, OtherIPsAfter, TokenUseCount, TokenApps, TokenResources, FirstTokenUse, LastTokenUse, DeviceAdded, DevicesAddedNames, DeviceOpsUsed, FirstDeviceAdded, LastDeviceAdded, AuthenticationRequirement, ConditionalAccessStatus, RiskLevelDuringSignIn, RiskState, UserAgent, SessionId, UniqueTokenIdentifier, CorrelationId
 | sort by DeviceCodeScore desc, EventTime desc
 //
-//| where Succeeded and TokenMoved          // token issued, then used from another network in the same session
-//| where DeviceAdded                       // device registered by this account after the sign-in
-//| where Succeeded and FirstDcForUser      // first device code sign-in this user has ever made
-//| where ResultType != "0"                 // failed attempts — someone was still asked for a code
+//| where Succeeded and (TokenMoved or BrokerToDrs or DeviceAdded)   // the token left, or became a device
+//| where LureBefore                          // the user was sent a device code link first — check every one, failed or not
+//| where NonMicrosoftApp or AppConsent       // the attacker's own app
+//| where FailedDcBefore > 0                  // codes were tried and expired before this one
+//| where ResultType != "0"                   // failed attempts — someone was still asked for a code
 //| summarize Users = dcount(UserPrincipalName), Apps = make_set(AppDisplayName, 10) by bin(EventTime, 1d)  // campaign scale

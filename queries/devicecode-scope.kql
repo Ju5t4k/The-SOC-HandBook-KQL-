@@ -1,25 +1,37 @@
 //DeviceCode scope query
 //
-// Who else. Fill in one indicator from devicecode.kql. ASN finds campaigns best.
+// Who else. Fill in one indicator from devicecode.kql. ASN finds campaigns best; with every check blank, it lists everyone sent a device code link.
 let TimeToCheck = 30d;
 let IPCheck = "";
 let ASNCheck = "";
 let AppCheck = "";
 let UserAgentCheck = "";
+let SenderCheck = "";                     // lure sender address or domain
 //
+let LureTerms = dynamic(["devicelogin","deviceauth"]);
+let DeviceOps = dynamic(["Add device","Register device","Add registered owner to device","Add registered users to device"]);
 let Job = IdentityInfo | where TimeGenerated >= ago(90d) | extend AccountUPN = tolower(AccountUPN) | summarize arg_max(TimeGenerated, *) by AccountObjectId | extend JobDetails = bag_pack("0.Job", JobTitle, "1.RiskLevel", RiskLevel, "2.AssignedRoles", AssignedRoles) | project JobDetails, JobUserKey = AccountUPN;
 //
 union isfuzzy=true
     // Device code sign-ins from the same address, network, app or agent.
     (SigninLogs | where TimeGenerated >= ago(TimeToCheck) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | extend Hit = "DeviceCode", Actor = UserPrincipalName, Asn = AutonomousSystemNumber, Agent = UserAgent, Evidence = strcat(ResultType, " | ", AppDisplayName, " -> ", ResourceDisplayName)),
     // Token use from the same infrastructure, against any user.
-    (AADNonInteractiveUserSignInLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | extend Hit = "TokenUse", Actor = UserPrincipalName, Asn = AutonomousSystemNumber, Agent = UserAgent, Evidence = strcat(SignInEventTypes, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | token=", IncomingTokenType))
+    (AADNonInteractiveUserSignInLogs | where TimeGenerated >= ago(TimeToCheck) | where ResultType == "0" | extend Hit = "TokenUse", Actor = UserPrincipalName, Asn = AutonomousSystemNumber, Agent = UserAgent, Evidence = strcat(SignInEventTypes, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | token=", IncomingTokenType)),
+    // Devices registered from the same address. Often blank: registrations logged by the Device Registration Service carry no IP.
+    (AuditLogs | where TimeGenerated >= ago(TimeToCheck) | where OperationName has_any (DeviceOps) | extend IPAddress = tostring(InitiatedBy.user.ipAddress) | where isnotempty(IPAddress) | extend Hit = "DeviceRegistered", Actor = tostring(InitiatedBy.user.userPrincipalName), Evidence = strcat(OperationName, " | ", tostring(TargetResources[0].displayName))),
+    // Graph calls from the same address, any user. Needs the Graph activity log diagnostic setting.
+    (MicrosoftGraphActivityLogs | where TimeGenerated >= ago(TimeToCheck) | where isnotempty(IPCheck) and IPAddress contains IPCheck | summarize TimeGenerated = min(TimeGenerated), Calls = count() by UserId, IPAddress, AppId, Agent = UserAgent | extend Hit = "Graph", Actor = UserId, AppDisplayName = AppId, Evidence = strcat(Calls, " Graph calls")),
+    // Everyone sent a device code link, by mail or Teams.
+    (EmailUrlInfo | where TimeGenerated >= ago(TimeToCheck) | where Url has_any (LureTerms) | join kind=inner (EmailEvents | where TimeGenerated >= ago(TimeToCheck) | project NetworkMessageId, RecipientEmailAddress, SenderFromAddress, Subject, SenderIPv4) on NetworkMessageId | extend Hit = "Lure", Actor = RecipientEmailAddress, Sender = SenderFromAddress, IPAddress = SenderIPv4, Evidence = strcat("mail from ", SenderFromAddress, " | ", Subject, " | ", Url)),
+    (MessageUrlInfo | where TimeGenerated >= ago(TimeToCheck) | where Url has_any (LureTerms) | join kind=inner (MessageEvents | where TimeGenerated >= ago(TimeToCheck) | mv-expand Rcpt = RecipientDetails | project TeamsMessageId, Recipient = tostring(Rcpt.RecipientSmtpAddress), SenderEmailAddress, SenderDisplayName) on TeamsMessageId | extend Hit = "Lure", Actor = Recipient, Sender = SenderEmailAddress, Evidence = strcat("Teams from ", SenderDisplayName, " <", SenderEmailAddress, "> | ", Url))
 | where (isnotempty(IPCheck) and IPAddress contains IPCheck) or (isnotempty(ASNCheck) and Asn == ASNCheck) or (isnotempty(AppCheck) and AppDisplayName contains AppCheck) or (isnotempty(UserAgentCheck) and Agent contains UserAgentCheck)
+    or (Hit == "Lure" and ((isnotempty(SenderCheck) and Sender contains SenderCheck) or (isempty(IPCheck) and isempty(ASNCheck) and isempty(AppCheck) and isempty(UserAgentCheck) and isempty(SenderCheck))))
 | extend UserKey = tolower(Actor)
 | join kind=leftouter Job on $left.UserKey == $right.JobUserKey
 | project-rename EventTime = TimeGenerated
-| project EventTime, Hit, Actor, JobDetails, IPAddress, Asn, AppDisplayName, ResourceDisplayName, Agent, Evidence, ConditionalAccessStatus, RiskLevelDuringSignIn
+| project EventTime, Hit, Actor, JobDetails, Sender, IPAddress, Asn, AppDisplayName, ResourceDisplayName, Agent, Evidence, ConditionalAccessStatus, RiskLevelDuringSignIn
 | sort by EventTime asc
 //
-//| summarize Users = dcount(Actor), Hits = make_set(Hit, 4), First = min(EventTime), Last = max(EventTime) by bin(EventTime, 1d)  // campaign scale
-//| summarize Hits = make_set(Hit, 4), Apps = make_set(AppDisplayName, 10), First = min(EventTime) by Actor  // one line per user
+//| where Hit == "Lure"                                  // who was sent the link — then check each for a DeviceCode row
+//| summarize Users = dcount(Actor), Hits = make_set(Hit, 6), First = min(EventTime), Last = max(EventTime) by bin(EventTime, 1d)  // campaign scale
+//| summarize Hits = make_set(Hit, 6), Apps = make_set(AppDisplayName, 10), First = min(EventTime) by Actor  // one line per user

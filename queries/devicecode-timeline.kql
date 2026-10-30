@@ -1,38 +1,67 @@
 //DeviceCode timeline query
 //
-// The device code incident in order. Set PivotTime to EventTime from devicecode.kql.
+// The device code incident in order: the set-up in the days before, the code, and what the token did after. Set PivotTime to EventTime from devicecode.kql.
 let PivotTime = now();
-let BeforeWindow = 4h;
+let BeforeWindow = 4h;                    // sign-ins, mail and directory changes just before the pivot
+let PriorWindow = 7d;                     // lures, earlier code attempts and app changes before the pivot
 let AfterWindow = 48h;
-let UserIdentityCheck = "";
+let UserIdentityCheck = "";               // set this: the Graph and outbound-mail phases only run for a named user
 //
 let StartTime = PivotTime - BeforeWindow;
+let PriorStart = PivotTime - PriorWindow;
 let EndTime = PivotTime + AfterWindow;
 let DeviceOps = dynamic(["Add device","Register device","Add registered owner to device","Add registered users to device","Add Windows Hello for Business credential","Add passwordless phone sign-in credential","Add Passkey (device-bound)","Add platform credential"]);
+// App changes. The attacker's app, or a secret on an existing one, is often set up before the phish.
+let AppOps = dynamic(["Add application","Add service principal","Consent to application","Add delegated permission grant","Add app role assignment to service principal","Add service principal credentials","Certificates and secrets management","Add owner to application","Add owner to service principal","Update application"]);
+let LureTerms = dynamic(["devicelogin","deviceauth"]);
+let UserMap = SigninLogs | where TimeGenerated between (PriorStart .. EndTime) | where isnotempty(UserIdentityCheck) and UserPrincipalName contains UserIdentityCheck | summarize by UserId, Upn = UserPrincipalName;
+// Device names this user registered, to find sign-ins made from them.
+let RegisteredNames = toscalar(AuditLogs | where TimeGenerated between (PriorStart .. EndTime) | where OperationName has_any (DeviceOps) | where tostring(TargetResources) contains UserIdentityCheck or tostring(InitiatedBy) contains UserIdentityCheck | mv-expand T = TargetResources | where tostring(T.type) =~ "Device" | summarize make_set(tostring(T.displayName), 50));
+// Service principals this user created, consented to or gave a secret, so their sign-ins can be shown.
+let UserSpIds = toscalar(AuditLogs | where TimeGenerated between (PriorStart .. EndTime) | where OperationName has_any (AppOps) | where tostring(InitiatedBy.user.userPrincipalName) contains UserIdentityCheck and isnotempty(tostring(InitiatedBy.user.userPrincipalName)) | mv-expand T = TargetResources | where tostring(T.type) =~ "ServicePrincipal" | summarize make_set(tostring(T.id), 100));
 //
 union isfuzzy=true
-    // 1 — the phish that carried the code: inbound mail, and Teams chats from outside.
+    // 0 — before: earlier device code attempts by this user. Codes expire in 15 minutes, so attackers re-send.
+    (SigninLogs | where TimeGenerated between (PriorStart .. StartTime) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | extend Phase = "0-Prior code", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("deviceCode ", ResultType, " ", ResultDescription, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber)),
+    // 0 — before: apps created, consented or given secrets anywhere in the tenant. Shown for every actor.
+    (AuditLogs | where TimeGenerated between (PriorStart .. PivotTime) | where OperationName has_any (AppOps) | extend Phase = "0-Prior apps", Source = "AuditLogs", Keep = true, Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", tostring(InitiatedBy.user.ipAddress), " | target=", tostring(TargetResources[0].displayName), " ", tostring(TargetResources[0].type))),
+    // 1 — lures: device code links mailed, sent on Teams, clicked, or opened in a browser from mail or Teams.
+    (EmailUrlInfo | where TimeGenerated between (PriorStart .. EndTime) | where Url has_any (LureTerms) | join kind=inner (EmailEvents | where TimeGenerated between (PriorStart .. EndTime) | project NetworkMessageId, RecipientEmailAddress, SenderFromAddress, Subject, DeliveryAction, DeliveryLocation) on NetworkMessageId | extend Phase = "1-Lure", Source = "EmailUrlInfo", Actor = RecipientEmailAddress, Detail = strcat("mail from ", SenderFromAddress, " | ", Subject, " | ", Url, " | ", DeliveryAction, "/", DeliveryLocation)),
+    (MessageUrlInfo | where TimeGenerated between (PriorStart .. EndTime) | where Url has_any (LureTerms) | join kind=inner (MessageEvents | where TimeGenerated between (PriorStart .. EndTime) | mv-expand Rcpt = RecipientDetails | project TeamsMessageId, Recipient = tostring(Rcpt.RecipientSmtpAddress), SenderEmailAddress, SenderDisplayName, IsExternalThread) on TeamsMessageId | extend Phase = "1-Lure", Source = "MessageUrlInfo", Actor = Recipient, Detail = strcat("Teams from ", SenderDisplayName, " <", SenderEmailAddress, "> external=", IsExternalThread, " | ", Url)),
+    (UrlClickEvents | where TimeGenerated between (PriorStart .. EndTime) | where Url has_any (LureTerms) | extend Phase = "1-Lure", Source = "UrlClickEvents", Actor = AccountUpn, Detail = strcat("clicked ", Url, " | ", ActionType, " | ", Workload, " | ", IPAddress)),
+    (DeviceEvents | where TimeGenerated between (PriorStart .. EndTime) | where ActionType == "BrowserLaunchedToOpenUrl" | where RemoteUrl has_any (LureTerms) | extend Phase = "1-Lure", Source = "DeviceEvents", Actor = InitiatingProcessAccountUpn, Detail = strcat("opened ", RemoteUrl, " from ", InitiatingProcessFileName, " on ", DeviceName)),
+    // 1 — everything else that arrived just before: inbound mail and Teams chats.
     (EmailEvents | where TimeGenerated between (StartTime .. EndTime) | where EmailDirection == "Inbound" | extend Phase = "1-Delivery", Source = "EmailEvents", Actor = RecipientEmailAddress, Detail = strcat("from ", SenderFromAddress, " | ", Subject, " | urls=", tostring(UrlCount), " | ", DeliveryAction, "/", DeliveryLocation)),
     (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where OfficeWorkload =~ "MicrosoftTeams" | where Operation in~ ("ChatCreated","MemberAdded","MessageSent","MessageCreatedHasLink") | extend Phase = "1-Delivery", Source = "OfficeActivity", Actor = UserId, Detail = strcat(Operation, " | ", ResultStatus, " | ", ClientIP)),
     // 2 — the device code sign-in. It looks clean: real user, real MFA, real address.
-    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | extend Phase = "2-Code entry", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("deviceCode ", ResultType, " ", ResultDescription, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | MFA=", AuthenticationRequirement, " | CA=", ConditionalAccessStatus, " | session=", SessionId)),
+    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol =~ "deviceCode" or OriginalTransferMethod =~ "deviceCodeFlow" | extend Phase = "2-Code entry", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("deviceCode ", ResultType, " ", ResultDescription, " | ", AppDisplayName, " (owner ", AppOwnerTenantId, ") -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | MFA=", AuthenticationRequirement, " | CA=", ConditionalAccessStatus, " | session=", SessionId)),
     // 3 — the user's other interactive sign-ins.
-    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol !~ "deviceCode" and OriginalTransferMethod !~ "deviceCodeFlow" | extend Phase = "3-Sign-ins", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("sign-in ", ResultType, " | ", AppDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | ", ClientAppUsed)),
+    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where AuthenticationProtocol !~ "deviceCode" and OriginalTransferMethod !~ "deviceCodeFlow" | extend Phase = "3-Sign-ins", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("sign-in ", ResultType, " | ", AppDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(LocationDetails.countryOrRegion), " | ", ClientAppUsed, " | device=", tostring(DeviceDetail.displayName))),
     // 4 — token use. The attacker appears here: same user, different network. Match the session id to phase 2.
     (AADNonInteractiveUserSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "4-Token use", Source = "NonInteractive", Actor = UserPrincipalName, Detail = strcat(SignInEventTypes, " ", ResultType, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | ", tostring(todynamic(LocationDetails).countryOrRegion), " | token=", IncomingTokenType, " | session=", SessionId)),
-    // 5 — applications signing in on their own after consent.
-    (AADServicePrincipalSignInLogs | where TimeGenerated between (StartTime .. EndTime) | extend Phase = "5-Service principal", Source = "ServicePrincipal", Actor = ServicePrincipalName, Detail = strcat(ResultType, " | ", AppId, " -> ", ResourceDisplayName, " | ", IPAddress)),
+    // 5 — apps this user created, consented to or gave a secret, signing in on their own.
+    (AADServicePrincipalSignInLogs | where TimeGenerated between (StartTime .. EndTime) | where ServicePrincipalId in (UserSpIds) | extend Phase = "5-Service principal", Source = "ServicePrincipal", Keep = true, Actor = ServicePrincipalName, Detail = strcat(ResultType, " | ", AppId, " -> ", ResourceDisplayName, " | ", IPAddress)),
     // 6 — devices and passwordless credentials registered. Each gives a credential that survives token revocation.
-    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where OperationName has_any (DeviceOps) | extend Phase = "6-Device", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", LoggedByService, " | ", tostring(InitiatedBy.user.ipAddress), " | target=", tostring(TargetResources))),
-    // 7 — every other directory change: MFA methods, consent, roles, secrets.
-    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where not(OperationName has_any (DeviceOps)) | extend Phase = "7-Directory", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Detail = strcat(OperationName, " | ", Result, " | ", tostring(InitiatedBy.user.ipAddress), " | target=", tostring(TargetResources))),
+    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where OperationName has_any (DeviceOps) | extend Phase = "6-Device", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Related = tostring(TargetResources), Detail = strcat(OperationName, " | ", Result, " | ", LoggedByService, " | ", tostring(InitiatedBy.user.ipAddress), " | target=", tostring(TargetResources))),
+    // 6 — sign-ins from a device registered in the window: the attacker's device using its PRT.
+    (SigninLogs | where TimeGenerated between (StartTime .. EndTime) | where isnotempty(tostring(DeviceDetail.displayName)) and tostring(DeviceDetail.displayName) in (RegisteredNames) | extend Phase = "6-Device sign-in", Source = "SigninLogs", Actor = UserPrincipalName, Detail = strcat("from device ", tostring(DeviceDetail.displayName), " | ", ResultType, " | ", AppDisplayName, " -> ", ResourceDisplayName, " | ", IPAddress, " ASN=", AutonomousSystemNumber, " | token=", IncomingTokenType)),
+    // 7 — every other directory change: MFA methods, consent, roles, secrets. Matched on actor or target.
+    (AuditLogs | where TimeGenerated between (StartTime .. EndTime) | where not(OperationName has_any (DeviceOps)) | extend Phase = "7-Directory", Source = "AuditLogs", Actor = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName)), Related = tostring(TargetResources), Detail = strcat(OperationName, " | ", Result, " | ", tostring(InitiatedBy.user.ipAddress), " | target=", tostring(TargetResources))),
     // 8 — Microsoft 365 activity: rules, downloads, sharing.
-    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation !in~ ("MailItemsAccessed") | extend Phase = "8-Cloud", Source = "OfficeActivity", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP, " | ", MailboxOwnerUPN))
-| where Actor contains UserIdentityCheck
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation !in~ ("MailItemsAccessed") | extend Phase = "8-Cloud", Source = "OfficeActivity", Actor = UserId, Detail = strcat(OfficeWorkload, " | ", Operation, " | ", ResultStatus, " | ", ClientIP, " | ", MailboxOwnerUPN)),
+    // 8 — mail read, one row per address per hour. Reads from the token's address are the disclosure.
+    (OfficeActivity | where TimeGenerated between (StartTime .. EndTime) | where Operation =~ "MailItemsAccessed" | extend ReadIP = coalesce(ClientIP, Client_IPAddress) | summarize First = min(TimeGenerated), Events = count() by UserId, ReadIP, Hour = bin(TimeGenerated, 1h) | extend TimeGenerated = First, Phase = "8-Mail read", Source = "OfficeActivity", Actor = UserId, Detail = strcat(Events, " MailItemsAccessed events from ", ReadIP)),
+    // 9 — what the token did in Microsoft Graph: calls per address and session, with mail searches counted. Needs the Graph activity log diagnostic setting.
+    (MicrosoftGraphActivityLogs | where TimeGenerated between (StartTime .. EndTime) | where UserId in ((UserMap | project UserId)) | extend Path = replace_regex(tolower(tostring(parse_url(RequestUri).Path)), @"/[0-9a-f-]{36}|/aa[a-z0-9_=-]{40,}", "/{id}") | summarize First = min(TimeGenerated), Calls = count(), Searches = countif(RequestUri has "search"), Methods = make_set(RequestMethod, 5), Paths = make_set(Path, 10) by UserId, IPAddress, AppId, SessionId, Slot = bin(TimeGenerated, 10m) | join kind=inner UserMap on UserId | extend TimeGenerated = First, Phase = "9-Graph", Source = "GraphActivity", Actor = Upn, Detail = strcat(Calls, " calls, ", Searches, " searches | ", strcat_array(Methods, ","), " | ", IPAddress, " | app=", AppId, " | session=", SessionId, " | ", strcat_array(Paths, ", "))),
+    // 10 — mail with links sent by the user after the pivot: internal device code phishing from the stolen mailbox.
+    (EmailEvents | where TimeGenerated between (PivotTime .. EndTime) | where isnotempty(UserIdentityCheck) and SenderFromAddress contains UserIdentityCheck | where EmailDirection in ("Intra-org","Outbound") and UrlCount > 0 | extend Phase = "10-Outbound", Source = "EmailEvents", Actor = SenderFromAddress, Detail = strcat(EmailDirection, " to ", RecipientEmailAddress, " | ", Subject, " | urls=", tostring(UrlCount)))
+| where Keep or Actor contains UserIdentityCheck or Related contains UserIdentityCheck
 | project-rename EventTime = TimeGenerated
 | project EventTime, Phase, Source, Actor, Detail
 | sort by EventTime asc
 //
-//| where Phase in ("2-Code entry","4-Token use")   // token issued and token used — compare IP, ASN and session
-//| where Phase == "6-Device"                         // device registration only
+//| where Phase startswith "0" or Phase == "1-Lure"   // the set-up before the code: earlier attempts, app changes, lures
+//| where Phase in ("2-Code entry","4-Token use")       // token issued and token used — compare IP, ASN and session
+//| where Phase in ("6-Device","6-Device sign-in")      // device registered, and the device being used
+//| where Phase in ("8-Mail read","9-Graph")            // what was read — the disclosure question
 //| summarize Events = count(), First = min(EventTime), Last = max(EventTime) by Phase
