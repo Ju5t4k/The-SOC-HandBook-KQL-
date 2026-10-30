@@ -31,3 +31,11 @@ jobs:
             echo "::error::Trailing whitespace in a .kql file."
             exit 1
           fi
+
+      - name: KQL structure (brackets, union separators, unused lets)
+        run: python3 tools/lint_kql.py queries detections
+
+      - name: Detection rules match their YAML and Sentinel limits
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 tools/check_rules.py
