@@ -34,8 +34,11 @@ union isfuzzy=true
         | extend UserKey = tolower(tostring(RawEventData.UserId))
         | where UserKey in (Users)
         | project TimeGenerated, UserKey, Operation = ActionType, AccessIP = IPAddress, Item = ObjectName, Source = "CloudAppEvents")
+// Count each source separately, then keep the higher count: with both connectors on, the same event arrives twice.
 | summarize FirstAccess = min(TimeGenerated), Downloads = countif(Operation in (FileOps)), MailAccess = countif(Operation == "MailItemsAccessed"),
-            SampleItems = make_set(Item, 15), Sources = make_set(Source, 2)
+            SampleItems = make_set(Item, 15)
+            by UserKey, AccessIP, Source
+| summarize FirstAccess = min(FirstAccess), Downloads = max(Downloads), MailAccess = max(MailAccess), SampleItems = take_any(SampleItems), Sources = make_set(Source, 2)
             by UserKey, AccessIP
 | where Downloads >= FileThreshold or MailAccess >= MailThreshold
 | join kind=inner CodeEntries on UserKey
