@@ -2,7 +2,8 @@
 //
 // The device code incident in order: the set-up in the days before, the code, and what the token did after.
 // Set PivotTime to EventTime from devicecode.kql or the alert. Pivot on a user, an IP, or both: IPCheck adds every row that mentions that address, whoever the actor.
-// Playbook: docs/devicecode-playbook.md#513-timeline. Lookback: PriorWindow before to AfterWindow after the pivot; set UserIdentityCheck or IPCheck, or it reads the whole tenant.
+// Lookback: PriorWindow before to AfterWindow after the pivot; set UserIdentityCheck or IPCheck, or it reads the whole tenant.
+// Playbook: docs/devicecode-playbook.md#513-timeline
 let PivotTime = now();
 let BeforeWindow = 4h;                    // sign-ins, mail and directory changes just before the pivot
 let PriorWindow = 7d;                     // lures, earlier code attempts and app changes before the pivot
